@@ -17,13 +17,66 @@ if (!require("pacman")) install.packages("pacman")
 library(pacman)
 
 # Use pacman to install and load the required packages
-p_load(haven, lmtest, dplyr, ggplot2, tidyr,glmnet,fixest,grf,writexl,readxl,ggpubr,openxlsx,svglite,rlang,doParallel,foreach)
+p_load(haven, lmtest, dplyr, ggplot2, tidyr,glmnet,fixest,grf,writexl,readxl,ggpubr,openxlsx,svglite,rlang,doParallel,foreach,data.table)
 # Define the path to your data folder
 DATA_PATH <- "~/exp_obs"
 
 ```
 
-## the nyc_extract to dataset_for_kevin part
+
+## the schd_work_011112.dta to nyc_extract.dta part
+```{r}
+
+#── STEP 0: define “globals” ────────────────────────────────────────────────────
+
+exp_obs    <- "D:/Dropbox/exp_and_obs_data/STAR_NYC_data"
+root       <- "z:/IRS_NYC/empirics"
+nyc_datadir<- file.path(root, "data")
+
+nyc_core_vars <- c(
+  "stuid", "year", "math", "grade", "sch", "class",
+  "orig_class_size", "Class_size", "t_exp_reg_full", "score", "other"
+)
+nyc_controls <- c(
+  "PREZl_score", "PREOl_other", "age09", "sped", "limited_english",
+  "student_grade", "female", "ethnicity", "lunch", "miss_lunch",
+  "post99_sped", "post99_limited_eng", "teacher"
+)
+# (score leads/lags were commented out in the Stata code)
+nyc_varlist <- c(nyc_core_vars, nyc_controls)
+
+#── STEP 1: read & subset ──────────────────────────────────────────────────────
+
+# read the full .dta, then select only the vars we need
+dt <- as.data.table(
+  read_dta(file.path(nyc_datadir, "schd_work_011112.dta"))
+)[ , ..nyc_varlist ]
+
+# filter out missing `class` (equivalent to `if class~=.`)
+dt <- dt[!is.na(class)]
+
+#── STEP 2: create group and random‐sampling variables ────────────────────────
+
+# sgym = group(sch, grade, year, math)
+# mathematically:  sgym_i = 𝒢((sch_i, grade_i, year_i, math_i))
+dt[ , sgym := .GRP, by = .(sch, grade, year, math) ]
+
+# for each student, mark the first record and draw a single Uniform(0,1)
+dt[ , index := seq_len(.N), by = stuid ]
+dt[ index == 1, temp := runif(.N) ]
+
+# then for each student, set rand = mean(temp) (i.e. the one value)
+dt[ , rand := mean(temp, na.rm = TRUE), by = stuid ]
+dt[ , temp := NULL ]  # drop helper
+
+#── STEP 3: save ───────────────────────────────────────────────────────────────
+
+write_dta(dt, file.path(exp_obs, "nyc_extract.dta"))
+
+```
+
+
+## the nyc_extract.dta to dataset_for_kevin_R_041825.dta
 
 
 
