@@ -1,0 +1,2864 @@
+
+
+
+
+
+
+
+# code to run before
+
+```{r}
+
+# Use pacman to install and load the required packages
+# Install pacman if not already installed
+if (!require("pacman")) install.packages("pacman")
+
+# Load pacman library
+library(pacman)
+
+# Use pacman to install and load the required packages
+p_load(haven, lmtest, dplyr, ggplot2, tidyr,glmnet,fixest,grf,writexl,readxl,ggpubr,openxlsx,svglite,rlang,doParallel,foreach)
+# Define the path to your data folder
+DATA_PATH <- "~/exp_obs"
+
+```
+
+## the nyc_extract to dataset_for_kevin part
+
+
+
+```{r}
+
+
+### 1. Load the NYC dataset and perform initial cleaning
+
+# Read data from file: "nyc_extract.dta"
+df <- read_dta(file.path(DATA_PATH, "nyc_extract.dta"))
+
+# Create age on January 1, 2009 and year of birth:
+df <- df %>%
+  mutate(
+    age09_full = floor(age09),
+    yob = 2009 - floor(age09)
+  )
+
+# Drop observations with missing key variables:
+df <- df %>%
+  filter(!is.na(student_grade), !is.na(score), !is.na(CLass_size))
+
+# Rename CLass_size to class_size:
+df <- df %>% rename(class_size = CLass_size)
+
+# Generate treatment indicator (exactly as in Stata)
+df <- df %>%
+  mutate(treatment = as.integer(class_size < 27))
+
+### 2. Create miss_lunch_new and sch3
+
+# Create miss_lunch_new:
+df <- df %>%
+  mutate(miss_lunch_new = if_else(year < 1999, 1L, miss_lunch)) %>%
+  mutate(miss_lunch_new = if_else(student_grade == 3, miss_lunch_new, NA_real_)) %>%
+  group_by(stuid) %>%
+  fill(miss_lunch_new, .direction = "downup") %>%
+  ungroup()
+
+# Define sch3: assign the value from 'sch' when student_grade == 3, otherwise NA.
+df <- df %>%
+  mutate(sch3 = if_else(student_grade == 3, sch, NA_real_))
+
+# Make sch3 consistent per stuid: take the first non-missing value.
+df <- df %>%
+  group_by(stuid) %>%
+  mutate(sch3 = first(na.omit(sch3))) %>%
+  ungroup()
+
+### 3. Select first occurrence per student for each subject
+
+df <- df %>%
+  arrange(stuid, student_grade, math, year) %>%
+  group_by(stuid, student_grade, math) %>%
+  mutate(first = row_number() == 1) %>%
+  ungroup() %>%
+  filter(first) %>%
+  select(-first)
+
+### 4. Generate math z-scores
+
+df <- df %>%
+  group_by(year, student_grade, yob, math) %>%
+  mutate(
+    aux_mean_math = mean(score, na.rm = TRUE),
+    aux_sd_math   = sd(score, na.rm = TRUE),
+    z_score       = (score - aux_mean_math) / aux_sd_math
+  ) %>%
+  ungroup() %>%
+  select(-aux_mean_math, -aux_sd_math)
+
+### 5. Generate combined test score
+
+df <- df %>%
+  group_by(stuid, student_grade) %>%
+  mutate(comb_z = mean(z_score, na.rm = TRUE)) %>%
+  ungroup()
+
+df <- df %>% filter(math == 1)
+df <- df %>% select(-math)
+
+df <- df %>%
+  group_by(year, student_grade, yob) %>%
+  mutate(
+    aux_mean = mean(comb_z, na.rm = TRUE),
+    aux_sd   = sd(comb_z, na.rm = TRUE)
+  ) %>%
+  ungroup() %>%
+  mutate(z_comb_score = (comb_z - aux_mean) / aux_sd) %>%
+  select(-aux_mean, -aux_sd, -comb_z) %>%
+  rename(comb_z = z_comb_score)
+
+df <- df %>%
+  select(-z_score) %>%
+  rename(z_score = comb_z)
+
+### 6. Keep only the useful variables
+
+df <- df %>%
+  select(stuid, student_grade, female, ethnicity, z_score, lunch,
+         miss_lunch, miss_lunch_new, yob, class_size, treatment, sch3)
+
+### 7. Handle duplicate observations
+
+df <- df %>%
+  group_by(stuid, student_grade) %>%
+  mutate(dup = n() > 1) %>%
+  ungroup()
+
+dup_list <- df %>% filter(dup) %>% select(stuid, student_grade)
+print(dup_list)
+
+dup_count <- nrow(dup_list)
+cat("Number of duplicates:", dup_count, "\n")
+
+df <- df %>% distinct(stuid, student_grade, .keep_all = TRUE)
+
+df <- df %>%
+  group_by(stuid, student_grade) %>%
+  mutate(dup_check = n() > 1) %>%
+  ungroup()
+dup_count_check <- sum(df$dup_check)
+cat("Duplicates after removal:", dup_count_check, "\n")
+
+df <- df %>% select(-dup, -dup_check)
+
+### 8. Reshape dataset from long to wide format using only stuid as pivot key
+
+df_wide_min <- df %>%
+  pivot_wider(
+    id_cols = stuid,
+    names_from = student_grade,
+    values_from = c(z_score, class_size, treatment, lunch, miss_lunch),
+    names_sep = ""
+  )
+cat("Number of observations in wide format with only stuid as key (df_wide_min): ",
+    nrow(df_wide_min), "\n")
+
+### 9. Aggregate extra variables by stuid
+
+# For each student, take the first (or a representative) value for the extra variables.
+extra_info <- df %>%
+  group_by(stuid) %>%
+  summarise(
+    yob = first(yob),
+    ethnicity = first(ethnicity),
+    female = first(female),
+    sch3 = first(sch3),
+    miss_lunch_new = first(miss_lunch_new)
+  ) %>%
+  ungroup()
+
+### 10. Join the extra information back to the wide dataset
+
+df_wide <- df_wide_min %>%
+  left_join(extra_info, by = "stuid")
+cat("Number of observations in final wide dataset after joining extra info: ",
+    nrow(df_wide), "\n")
+
+### 11. Merge graduate variables
+
+grad_new <- read_dta(file.path(DATA_PATH, "new_graduate_var.dta"))
+grad      <- read_dta(file.path(DATA_PATH, "graduate_var.dta"))
+
+df_final <- df_wide %>%
+  full_join(select(grad_new, stuid, eventcat), by = "stuid") %>%
+  full_join(grad, by = "stuid")
+cat("Number of observations in final dataset (df_final): ", nrow(df_final), "\n")
+
+# Save final combined dataset to a Stata file:
+write_dta(df_final, "dataset_for_kevin_R_041825.dta")
+
+```
+
+
+
+
+
+
+
+```{r}
+
+
+
+### Prepare NYC data
+df <- read_dta(file.path(DATA_PATH, "dataset_for_kevin_R_041825.dta")) %>%
+  filter(yob > 1984) %>%
+     filter(yob < 2000) %>%
+drop_na(z_score3, z_score4, z_score5, z_score6, z_score7, z_score8, graduate)
+
+
+
+# Using base R with the ifelse() function
+df$miss_grad <- ifelse(df$eventcat %in% c("graduate", "drop"), 0, 1)
+
+
+
+### Prepare STAR data
+star_raw <- read_dta(file.path(DATA_PATH, "STAR_extract.dta")) %>%
+  select(smalli, avsum3, avsum4, avsum5, avsum6, avsum7, avsum8, newsch,female,lunch,race,white) %>%
+  #drop_na(avsum3)
+  drop_na(avsum3, avsum4, avsum5, avsum6, avsum7, avsum8)
+
+
+
+
+#######some data manipulations
+# Rename the column 'lunch3' to 'lunch'
+colnames(df)[colnames(df) == "lunch3"] <- "lunch"
+
+
+
+# Add the 'black' column to star_raw where race equals 2
+star_raw$black <- ifelse(star_raw$race == 2, 1, 0)
+
+
+star_raw$other_race <- ifelse(star_raw$black == 0 & star_raw$white == 0, 1, 0)
+
+star_raw$miss_lunch_new <- ifelse(is.na(star_raw$lunch), 1, 0)
+
+
+# Add the 'white' column where ethnicity equals 4
+df$white <- ifelse(df$ethnicity == 4, 1, 0)
+
+# Add the 'black' column where ethnicity equals 3
+df$black <- ifelse(df$ethnicity == 3, 1, 0)
+
+
+df$other_race <- ifelse(df$black == 0 & df$white == 0, 1, 0)
+
+
+
+
+#################
+###the utility functions we use throughout
+#################
+
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+
+# ---------- interaction helper ----------
+create_full_interaction <- function(aux_vars){
+  if(length(aux_vars))
+    paste0("(", paste(aux_vars, collapse = " * "), ")")  # x*y*z ⇒ x+y+z+…
+  else
+    NULL                                                 # nothing to add
+}
+
+# ---------- drop-NULL shortcut (base R) ----------
+drop_null <- function(x) Filter(Negate(is.null), x)
+
+
+
+# Function to run STAR estimates with multiple intermediate outcomes and auxiliary variables
+run_star_estimates <- function(star_data, intermediate_grades, aux_vars = c()) {
+  # Remove rows with NA in relevant columns
+  relevant_cols <- c("smalli", "newsch", aux_vars)
+  star_data <- star_data %>% 
+    filter(if_all(all_of(relevant_cols), ~ !is.na(.)))
+  
+  # Prepare auxiliary variables for estimation by removing "miss_lunch_new"
+  aux_vars_for_estimation <- setdiff(aux_vars, "miss_lunch_new")
+  
+  # Initialize coefficients dataframe with treatment and auxiliary variables
+  star_coefs <- data.frame(grade = intermediate_grades)
+  star_coefs$coef_treatment <- NA
+  for (var in aux_vars) {
+    star_coefs[[paste0("coef_", var)]] <- NA
+  }
+  
+  for (g in intermediate_grades) {
+    col_name <- paste0("avsum", g)
+    star_data[[col_name]] <- standardize(star_data[[col_name]])
+    
+    
+        formula_str <- paste0(col_name, " ~ smalli")
+
+    if (length(aux_vars_for_estimation) > 0) {
+        ## add **fully-interacted** demographics ⟨x * y * z⟩
+        formula_str <- paste0(
+            formula_str, " + ",           # keep treatment
+            create_full_interaction(aux_vars_for_estimation)   # <<-- NEW
+        )
+    }
+    formula_str <- paste0(formula_str, " | newsch")
+    
+    
+    
+    # Estimate the model using feols
+    model <- feols(as.formula(formula_str), data = star_data)
+    
+    # Store coefficients: treatment and auxiliary variables from estimation.
+    star_coefs$coef_treatment[star_coefs$grade == g] <- coef(model)["smalli"]
+    for (var in aux_vars_for_estimation) {
+      star_coefs[[paste0("coef_", var)]][star_coefs$grade == g] <- coef(model)[var]
+    }
+    
+    # For miss_lunch_new, if present in aux_vars, set its coefficient to 0.
+    if ("miss_lunch_new" %in% aux_vars) {
+      star_coefs[["coef_miss_lunch_new"]][star_coefs$grade == g] <- 0
+    }
+  }
+  
+  return(star_coefs)
+}
+
+```
+
+
+
+# main1
+
+## the cluster computing ver
+
+### baseline experimental results for fig2/6, table 1
+
+
+```{r}
+
+
+set.seed(123)
+
+# If your original data frame is star_raw, you can overwrite in place:
+for (g in 3:8) {
+  col_name <- paste0("avsum", g)
+  star_raw[[col_name]] <- standardize(star_raw[[col_name]])
+}
+
+# Create a data frame with STAR estimates using feols
+star_true_estimates <- data.frame(
+  grade = 3:8,
+  coef = sapply(3:8, function(grade) {
+    col_name <- paste0("avsum", grade)
+    
+    # Run the fixed-effects regression using feols
+    model <- feols(as.formula(paste0(col_name, " ~ smalli | newsch")), data = star_raw)
+    
+    # Extract the coefficient for `smalli`
+    coef(model)["smalli"]
+  }),
+  se = sapply(3:8, function(grade) {
+    col_name <- paste0("avsum", grade)
+    
+    # Run the fixed-effects regression using feols
+    model <- feols(as.formula(paste0(col_name, " ~ smalli | newsch")), data = star_raw)
+    
+    # Extract the standard error for `smalli`
+    sqrt(vcov(model)["smalli", "smalli"])
+  })
+)
+
+# Export the STAR true estimates to an Excel file
+write.xlsx(star_true_estimates, file = "star_true_inuse.xlsx")
+```
+
+
+
+
+
+### results for fig2/3/6, table 1 and app table 2: robust to intermediate_outcomes specification and fully interacted covariates spec
+
+```{r}
+
+set.seed(123)
+n_boot <- 1000                      # bootstrap draws
+
+
+
+
+
+#########################################
+## 1. Set Up Parallel Backend
+#########################################
+
+RNGkind("L'Ecuyer-CMRG")      # use a parallel‐safe RNG
+
+
+# Detect and use a safe number of cores 
+max_workers <- 50  # Adjust this number if needed
+num_cores <- min(detectCores(), max_workers)
+cl <- makeCluster(num_cores)
+
+clusterSetRNGStream(cl, 123)  # propagate streams to workers
+
+
+registerDoParallel(cl)
+message(sprintf("Using %d worker(s) out of %d detected core(s).", num_cores, parallel::detectCores()))
+
+
+
+############################################################
+## 3.  Main analysis
+############################################################
+run_multi_analysis <- function(df, star_data,
+                               intermediate_grades,
+                               outcome_var = "graduate",
+                               aux_vars    = character()) {
+
+  ## 0. keep complete cases
+  df <- df %>% filter(if_all(all_of(
+           c("treatment3","yob","sch3", outcome_var, aux_vars)),
+           ~ !is.na(.)))
+
+  ## 1. STAR first-stage
+  star_estimates <- run_star_estimates(star_data,
+                                       intermediate_grades,
+                                       aux_vars)
+  betas    <- star_estimates$coef_treatment
+  beta_aux <- lapply(aux_vars,
+                     function(v) star_estimates[[paste0("coef_", v)]])
+  names(beta_aux) <- aux_vars
+  pred_vars <- paste0("z_score", intermediate_grades)
+
+  results <- data.frame()
+
+  ## 2. Observational OLS
+  rhs_ols <- paste(
+              drop_null(c("treatment3",
+                          create_full_interaction(aux_vars))),
+              collapse = " + ")
+  ols_formula <- paste0(outcome_var, " ~ ", rhs_ols, " | yob + sch3")
+
+  naive_model <- tryCatch(feols(as.formula(ols_formula), data = df),
+                          error = function(e){ warning("OLS failed: ", e$message); NULL })
+  if(!is.null(naive_model)){
+    results <- bind_rows(results,
+      data.frame(method  = "Observational OLS",
+                 outcome = outcome_var,
+                 intermediate = paste(intermediate_grades, collapse = ","),
+                 coef  = coef(naive_model)["treatment3"],
+                 se    = se(naive_model)["treatment3"]))
+  }
+
+  ## 3. Surrogate
+  surrogate_formula <- paste0(
+        outcome_var, " ~ ",
+        paste(pred_vars, collapse = " + "),
+        if(length(aux_vars)) paste0(" + ", create_full_interaction(aux_vars)) else "",
+        " | yob + sch3")
+
+  surrogate_model <- tryCatch(
+       feols(as.formula(surrogate_formula), data = df),
+       error = function(e){ warning("Surrogate failed: ", e$message); NULL })
+
+  if(!is.null(surrogate_model)){
+    gammas <- coef(surrogate_model)[pred_vars]
+    tau_sur <- sum(betas * gammas)
+
+    b_tau <- foreach(i = 1:n_boot, .combine = c,
+                     .packages = c("dplyr","fixest","rlang"),
+                     .export = c("run_star_estimates","standardize",
+                                 "create_full_interaction","drop_null")) %dopar% {
+      idx      <- sample(seq_len(nrow(df)), replace = TRUE)
+      df_b     <- df[idx,]
+      star_b   <- star_data[idx,]
+
+      se_b <- tryCatch(run_star_estimates(star_b,
+                                          intermediate_grades,
+                                          aux_vars),
+                       error = function(e) NULL)
+      if(is.null(se_b)) return(NA_real_)
+      betas_b  <- se_b$coef_treatment
+
+      mod_b <- tryCatch(feols(as.formula(surrogate_formula), data = df_b),
+                        error = function(e) NULL)
+      if(is.null(mod_b)) return(NA_real_)
+      gammas_b <- coef(mod_b)[pred_vars]
+      sum(betas_b * gammas_b)
+    }
+    se_sur <- sd(b_tau, na.rm = TRUE)
+
+    results <- bind_rows(results,
+      data.frame(method  = "Surrogate",
+                 outcome = outcome_var,
+                 intermediate = paste(intermediate_grades, collapse = ","),
+                 coef  = tau_sur,
+                 se    = se_sur))
+  }
+
+  ## 4. Experimental-Selection Correction
+  df_cf <- df
+  for(g in seq_along(intermediate_grades)){
+    zcol <- paste0("z_score", intermediate_grades[g])
+    scol <- paste0("selec",   intermediate_grades[g])
+    df_cf[[scol]] <- df_cf[[zcol]] - betas[g]*df_cf$treatment3
+    if(length(aux_vars)){
+      for(v in aux_vars)
+        df_cf[[scol]] <- df_cf[[scol]] - beta_aux[[v]][g]*df_cf[[v]]
+    }
+  }
+  selec_vars <- paste0("selec", intermediate_grades)
+
+  rhs_cf <- paste(
+              drop_null(c("treatment3",
+                          selec_vars,
+                          create_full_interaction(aux_vars))),
+              collapse = " + ")
+  cf_formula <- paste0(outcome_var, " ~ ", rhs_cf, " | yob + sch3")
+
+  cf_model <- tryCatch(feols(as.formula(cf_formula), data = df_cf),
+                       error = function(e){ warning("CF failed: ", e$message); NULL })
+
+  if(!is.null(cf_model)){
+    tau_cf <- coef(cf_model)["treatment3"]
+
+    b_cf <- foreach(i = 1:n_boot, .combine = c,
+                    .packages = c("dplyr","fixest","rlang"),
+                    .export = c("run_star_estimates","standardize",
+                                "create_full_interaction","drop_null")) %dopar% {
+      idx      <- sample(seq_len(nrow(df)), replace = TRUE)
+      df_b     <- df[idx,]
+      star_b   <- star_data[idx,]
+
+      se_b <- tryCatch(run_star_estimates(star_b,
+                                          intermediate_grades,
+                                          aux_vars),
+                       error = function(e) NULL)
+      if(is.null(se_b)) return(NA_real_)
+      betas_b <- se_b$coef_treatment
+      beta_aux_b <- lapply(aux_vars,
+                           function(v) se_b[[paste0("coef_", v)]])
+      names(beta_aux_b) <- aux_vars
+
+      # selection residuals
+      for(g in seq_along(intermediate_grades)){
+        zcol <- paste0("z_score", intermediate_grades[g])
+        scol <- paste0("selec",   intermediate_grades[g])
+        df_b[[scol]] <- df_b[[zcol]] - betas_b[g]*df_b$treatment3
+        if(length(aux_vars)){
+          for(v in aux_vars)
+            df_b[[scol]] <- df_b[[scol]] - beta_aux_b[[v]][g]*df_b[[v]]
+        }
+      }
+      rhs_b <- paste(
+                 drop_null(c("treatment3",
+                             paste0("selec", intermediate_grades),
+                             create_full_interaction(aux_vars))),
+                 collapse = " + ")
+      mod_b <- tryCatch(
+        feols(as.formula(paste0(outcome_var, " ~ ", rhs_b, " | yob + sch3")),
+              data = df_b),
+        error = function(e) NULL)
+      if(is.null(mod_b)) return(NA_real_)
+      coef(mod_b)["treatment3"]
+    }
+    se_cf <- sd(b_cf, na.rm = TRUE)
+
+    results <- bind_rows(results,
+      data.frame(method  = "Experimental Selection Correction",
+                 outcome = outcome_var,
+                 intermediate = paste(intermediate_grades, collapse = ","),
+                 coef  = tau_cf,
+                 se    = se_cf))
+  }
+
+  return(results)
+}
+
+############################################################
+## 4.  Example grid
+############################################################
+short_term_combinations <- list(c(3))
+aux_cov_col <- list(
+  c("other_race","black","female","lunch","miss_lunch_new"),
+  character(0)
+)
+
+all_results_list <- list(); counter <- 1
+
+for(aux_vars in aux_cov_col){
+  for(intermediate_grades in short_term_combinations){
+
+    max_grade <- max(intermediate_grades)
+    z_scores  <- if(max_grade <= 8) paste0("z_score", max_grade:8) else character(0)
+    outcome_vars <- c(z_scores, "graduate")
+
+    for(outcome_var in outcome_vars){
+      res <- run_multi_analysis(df          = df,
+                                star_data   = star_raw,
+                                intermediate_grades = intermediate_grades,
+                                outcome_var = outcome_var,
+                                aux_vars    = aux_vars)
+
+      all_results_list[[counter]] <- res %>%
+        mutate(intermediate_grades = paste(intermediate_grades, collapse = ","),
+               outcome_var        = outcome_var,
+               covariate_spec     = if(length(aux_vars)) paste(aux_vars, collapse = ",") else "none")
+      counter <- counter + 1
+    }
+  }
+}
+
+final_results <- bind_rows(all_results_list) %>%
+                 arrange(intermediate_grades, outcome_var, method)
+
+print(final_results)
+write_xlsx(final_results,
+           "LU_fig3_intermediates_cluster_boot1000_outcomes_interact.xlsx")
+
+############################################################
+## 5.  Clean-up
+############################################################
+stopCluster(cl)
+
+```
+
+
+
+
+
+
+### results for fig4: subgroup spec
+```{r}
+
+# Set reproducibility seed
+set.seed(123)
+
+# Set bootstrap iterations
+n_boot <- 1000
+
+#########################################
+## 1. Set Up Parallel Backend
+#########################################
+
+RNGkind("L'Ecuyer-CMRG")      # use a parallel‐safe RNG
+
+
+# Detect and use a safe number of cores 
+max_workers <- 50  # Adjust this number if needed
+num_cores <- min(detectCores(), max_workers)
+cl <- makeCluster(num_cores)
+
+clusterSetRNGStream(cl, 123)  # propagate streams to workers
+
+
+registerDoParallel(cl)
+message(sprintf("Using %d worker(s) out of %d detected core(s).", num_cores, parallel::detectCores()))
+
+
+#########################################
+## 2. Standardize Function
+#########################################
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+#########################################
+## 3. Updated Main Analysis Function with Parallel Bootstrapping
+#########################################
+run_multi_analysis <- function(df, star_data, intermediate_grades, outcome_var = "graduate", aux_vars = c()) {
+  
+  # Remove rows with NA in relevant columns
+  relevant_cols <- c("treatment3", "yob", "sch3", outcome_var, aux_vars)
+  df <- df %>% filter(if_all(all_of(relevant_cols), ~!is.na(.)))
+  
+  # 1. Get STAR estimates for specified grades
+  star_estimates <- run_star_estimates(star_data, intermediate_grades, aux_vars)
+  
+  # Initialize results data frame
+  results <- data.frame(
+    method = character(),
+    outcome = character(),
+    intermediate = character(),
+    coef = numeric(),
+    se = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Extract STAR coefficients
+  betas <- star_estimates$coef_treatment
+  beta_aux <- list()
+  for (var in aux_vars) {
+    beta_aux[[var]] <- star_estimates[[paste0("coef_", var)]]
+  }
+  
+  # Create predictor variables for the surrogate regression
+  pred_vars <- paste0("z_score", intermediate_grades)
+  
+  ### 2. Observational OLS Estimation ###
+  naive_formula_str <- paste0(outcome_var, " ~ treatment3")
+  if (length(aux_vars) > 0) {
+    naive_formula_str <- paste0(naive_formula_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  naive_formula_str <- paste0(naive_formula_str, " | yob + sch3")
+  
+  naive_model <- tryCatch({
+    feols(as.formula(naive_formula_str), data = df)
+  }, error = function(e) {
+    warning(paste("Observational OLS failed for outcome_var =", outcome_var, 
+                  "with intermediate_grades =", paste(intermediate_grades, collapse = ",")))
+    return(NULL)
+  })
+  
+  if (!is.null(naive_model)) {
+    naive_coef <- coef(naive_model)["treatment3"]
+    naive_se <- summary(naive_model)$se["treatment3"]
+    
+    results <- rbind(results, data.frame(
+      method = "Observational OLS",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = naive_coef,
+      se = naive_se,
+      stringsAsFactors = FALSE
+    ))
+  } else {
+    results <- rbind(results, data.frame(
+      method = "Observational OLS",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = NA,
+      se = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  ### 3. Surrogate Estimator ###
+  surrogate_formula_str <- paste0(
+    outcome_var, " ~ ", 
+    paste(pred_vars, collapse = " + ")
+  )
+  if (length(aux_vars) > 0) {
+    surrogate_formula_str <- paste0(surrogate_formula_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  surrogate_formula_str <- paste0(surrogate_formula_str, " | yob + sch3")
+  
+  surrogate_model <- tryCatch({
+    feols(as.formula(surrogate_formula_str), data = df)
+  }, error = function(e) {
+    warning(paste("Surrogate Estimator failed for outcome_var =", outcome_var, 
+                  "with intermediate_grades =", paste(intermediate_grades, collapse = ",")))
+    return(NULL)
+  })
+  
+  if (!is.null(surrogate_model)) {
+    gammas <- coef(surrogate_model)[pred_vars]
+    gamma_aux <- list()
+    if (length(aux_vars) > 0) {
+      for (var in aux_vars) {
+        gamma_aux[[var]] <- coef(surrogate_model)[var]
+      }
+    }
+    
+    surrogate_estimate <- sum(betas * gammas)
+    
+    #### Parallel Bootstrap for Surrogate Standard Error ####
+bootstrap_surrogate_estimates <- foreach(i = 1:n_boot, .combine = c,
+                                         .packages = c("dplyr", "fixest", "rlang"), 
+                                         .export = c("run_star_estimates", "standardize")) %dopar% {
+  # Resample with replacement
+  sample_indices <- sample(1:nrow(df), size = nrow(df), replace = TRUE)
+  df_boot <- df[sample_indices, ]
+  star_data_boot <- star_data[sample_indices, ]
+  
+  
+  star_estimates_boot <- tryCatch({
+    run_star_estimates(star_data_boot, intermediate_grades, aux_vars)
+  }, error = function(e) {
+    message("Error in run_star_estimates on iteration ", i, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(star_estimates_boot)) return(NA)
+  
+  betas_boot <- star_estimates_boot$coef_treatment
+  surrogate_model_boot <- tryCatch({
+    feols(as.formula(surrogate_formula_str), data = df_boot)
+  }, error = function(e) {
+    message("Error in feols for surrogate_model_boot on iteration ", i, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(surrogate_model_boot)) return(NA)
+  
+  gammas_boot <- coef(surrogate_model_boot)[pred_vars]
+  surrogate_estimate_boot <- sum(betas_boot * gammas_boot)
+  surrogate_estimate_boot
+                                         }
+    
+    
+    surrogate_se <- sd(bootstrap_surrogate_estimates, na.rm = TRUE)
+    
+    results <- rbind(results, data.frame(
+      method = "Surrogate",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = surrogate_estimate,
+      se = surrogate_se,
+      stringsAsFactors = FALSE
+    ))
+    
+    # Store the auxiliary coefficients for the surrogate estimator
+    if (length(aux_vars) > 0) {
+      beta_aux_str <- paste(paste(names(beta_aux), unlist(beta_aux), sep = ": "), collapse = ", ")
+      gamma_aux_str <- paste(paste(names(gamma_aux), unlist(gamma_aux), sep = ": "), collapse = ", ")
+    } else {
+      beta_aux_str <- NA
+      gamma_aux_str <- NA
+    }
+    
+    surrogate_auxiliary <- data.frame(
+      method = "Surrogate",
+      beta_aux = beta_aux_str,
+      gamma_aux = gamma_aux_str,
+      stringsAsFactors = FALSE
+    )
+    
+  } else {
+    results <- rbind(results, data.frame(
+      method = "Surrogate",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = NA,
+      se = NA,
+      stringsAsFactors = FALSE
+    ))
+    
+    surrogate_auxiliary <- data.frame(
+      method = "Surrogate",
+      beta_aux = NA,
+      gamma_aux = NA,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  ### 4. Control Function Method ###
+  df_control <- df
+  for (i in seq_along(intermediate_grades)) {
+    grade <- intermediate_grades[i]
+    z_score_col <- paste0("z_score", grade)
+    selec_col <- paste0("selec", grade)
+    
+    # Base selection term: z_i - beta_i*treatment3
+    df_control[[selec_col]] <- df_control[[z_score_col]] - betas[i] * df_control$treatment3
+    
+    # Add auxiliary terms if any
+    if (length(aux_vars) > 0) {
+      for (var in aux_vars) {
+        df_control[[selec_col]] <- df_control[[selec_col]] - beta_aux[[var]][i] * df_control[[var]]
+      }
+    }
+  }
+  
+  selec_vars <- paste0("selec", intermediate_grades)
+  control_formula_str <- paste0(
+    outcome_var, " ~ treatment3 + ", paste(selec_vars, collapse = " + ")
+  )
+  if (length(aux_vars) > 0) {
+    control_formula_str <- paste0(control_formula_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  control_formula_str <- paste0(control_formula_str, " | yob + sch3")
+  
+  control_model <- tryCatch({
+    feols(as.formula(control_formula_str), data = df_control)
+  }, error = function(e) {
+    warning(paste("Control Function Method failed for outcome_var =", outcome_var, 
+                  "with intermediate_grades =", paste(intermediate_grades, collapse = ",")))
+    return(NULL)
+  })
+  
+  if (!is.null(control_model)) {
+    control_coef <- coef(control_model)["treatment3"]
+    control_se <- summary(control_model)$se["treatment3"]
+    
+    results <- rbind(results, data.frame(
+      method = "Experimental Selection Correction",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = control_coef,
+      se = control_se,
+      stringsAsFactors = FALSE
+    ))
+    
+    #### Parallel Bootstrap for Control Function Standard Error ####
+bootstrap_cf_estimates <- foreach(i = 1:n_boot, .combine = c,
+                                  .packages = c("dplyr", "fixest", "rlang"),
+                                  .export = c("run_star_estimates", "standardize")) %dopar% {
+  sample_indices <- sample(1:nrow(df), size = nrow(df), replace = TRUE)
+  df_boot <- df[sample_indices, ]
+  star_data_boot <- star_data[sample_indices, ]
+  
+  star_estimates_boot <- tryCatch({
+    run_star_estimates(star_data_boot, intermediate_grades, aux_vars)
+  }, error = function(e) { return(NULL) })
+  
+  if(is.null(star_estimates_boot)) return(NA)
+  
+  betas_boot <- star_estimates_boot$coef_treatment
+  beta_aux_boot <- list()
+  for(var in aux_vars) {
+    beta_aux_boot[[var]] <- star_estimates_boot[[paste0("coef_", var)]]
+  }
+  
+  df_control_boot <- df_boot
+  for (j in seq_along(intermediate_grades)) {
+    grade <- intermediate_grades[j]
+    z_score_col <- paste0("z_score", grade)
+    selec_col <- paste0("selec", grade)
+    
+    df_control_boot[[selec_col]] <- df_control_boot[[z_score_col]] - betas_boot[j] * df_control_boot$treatment3
+    
+    if(length(aux_vars) > 0) {
+      for(var in aux_vars) {
+        df_control_boot[[selec_col]] <- df_control_boot[[selec_col]] - beta_aux_boot[[var]][j] * df_control_boot[[var]]
+      }
+    }
+  }
+  
+  control_formula_boot_str <- paste0(
+    outcome_var, " ~ treatment3 + ", 
+    paste(selec_vars, collapse = " + ")
+  )
+  if(length(aux_vars) > 0) {
+    control_formula_boot_str <- paste0(control_formula_boot_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  control_formula_boot_str <- paste0(control_formula_boot_str, " | yob + sch3")
+  
+  control_model_boot <- tryCatch({
+    feols(as.formula(control_formula_boot_str), data = df_control_boot)
+  }, error = function(e) { return(NULL) })
+  
+  if(is.null(control_model_boot)) return(NA)
+  
+  control_coef_boot <- coef(control_model_boot)["treatment3"]
+  control_coef_boot
+}
+    
+    # Replace the original standard error with the bootstrapped version
+    control_se_boot <- sd(bootstrap_cf_estimates, na.rm = TRUE)
+    results$se[results$method == "Experimental Selection Correction" &
+                 results$outcome == outcome_var &
+                 results$intermediate == paste(intermediate_grades, collapse = ",")] <- control_se_boot
+    
+  } else {
+    results <- rbind(results, data.frame(
+      method = "Experimental Selection Correction",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = NA,
+      se = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Return list with main results and supplementary components
+  return(list(
+    results = results,
+    star_estimates = star_estimates,
+    surrogate_components = list(
+      betas = betas,
+      beta_aux = beta_aux,
+      gammas = if (exists("gammas")) gammas else NA,
+      gamma_aux = if (exists("gamma_aux")) gamma_aux else NA
+    ),
+    surrogate_auxiliary = surrogate_auxiliary
+  ))
+}
+
+#########################################
+## 4. Example: Looping Over Combinations and Aggregating Results
+#########################################
+# (Assumes df and star_raw are already loaded in your workspace)
+
+
+
+df <- df %>%
+  mutate(ethnicity = as.character(as_factor(ethnicity)))
+
+star_raw <- star_raw %>%
+  mutate(race = as.character(as_factor(race)))
+
+# # Define subgroups
+subgroups <- list(
+  list(
+    name = "Entire_Population",
+    df_subset   = df,
+    star_subset = star_raw
+  ),
+  list(
+    name = "Female",
+    df_subset   = df   %>% filter(female == 1),
+    star_subset = star_raw %>% filter(female == 1)
+  ),
+  list(
+    name = "Male",
+    df_subset   = df   %>% filter(female == 0),
+    star_subset = star_raw %>% filter(female == 0)
+  ),
+  list(
+    name = "Black",
+    df_subset   = df   %>% filter(ethnicity == "BLACK"),
+    star_subset = star_raw %>% filter(race      == "Black")
+  ),
+  list(
+    name = "White",
+    df_subset   = df   %>% filter(ethnicity == "WHITE"),
+    star_subset = star_raw %>% filter(race      == "White")
+  ),
+
+  list(
+    name = "Lunch_Eligible",
+    df_subset   = df   %>% filter(miss_lunch_new == 0, lunch == 1),
+    star_subset = star_raw %>% filter(miss_lunch_new == 0, lunch == 1)
+  ),
+  list(
+    name = "Lunch_Ineligible",
+    df_subset   = df   %>% filter(miss_lunch_new == 0, lunch == 0),
+    star_subset = star_raw %>% filter(miss_lunch_new == 0, lunch == 0)
+  )
+)
+short_term_combinations <- list(c(3))
+
+# Initialize a list to store all combined results
+all_results_list <- list()
+counter <- 1
+
+# Loop through each subgroup
+for(subgroup in subgroups) {
+  subgroup_name <- subgroup$name
+  cat("Processing subgroup:", subgroup_name, "\n")
+  
+  # Subset data
+  df_subgroup <- subgroup$df_subset
+  star_subset <- subgroup$star_subset
+  
+  # Loop over your short-term combinations
+  for(intermediate_grades in short_term_combinations) {
+    
+    # Get outcome variables
+    #outcome_vars <- get_outcome_vars(intermediate_grades)  # As defined in your code
+    outcome_vars <- c("graduate")  # As defined in your code
+    
+    # For each outcome, run analysis
+    for(outcome_var in outcome_vars) {
+      
+      
+      
+      # Run the multi-analysis function (no aux_vars)   
+      analysis_result <- run_multi_analysis(
+        df = df_subgroup,
+        star_data = star_subset,
+        intermediate_grades = intermediate_grades,
+        outcome_var = outcome_var,
+        aux_vars = c()
+      )
+      
+      # Extract and combine results
+      results_df <- analysis_result$results
+      surrogate_auxiliary <- analysis_result$surrogate_auxiliary
+      #lu_auxiliary <- analysis_result$lu_auxiliary
+
+
+
+      combined_results <- results_df %>%
+        mutate(
+          subgroup = subgroup_name,
+          intermediate_grades = paste(intermediate_grades, collapse = ","),
+          outcome_var = outcome_var
+        ) %>%
+        left_join(surrogate_auxiliary, by = "method") %>%
+        #left_join(lu_auxiliary, by = "method") %>%
+        select(
+          subgroup,
+          intermediate_grades,
+          outcome_var,
+          method,
+          outcome,
+          intermediate,
+          coef,
+          se,
+          # etc...
+        )
+      
+      all_results_list[[counter]] <- combined_results
+      counter <- counter + 1
+    }
+  }
+}
+
+# Combine and export
+final_results <- bind_rows(all_results_list) %>%
+  arrange(subgroup, intermediate_grades, outcome_var, method)
+
+write_xlsx(final_results, "all_combined_results_with_LU_and_subgroups_boot1000inuse_withlunch.xlsx")
+
+
+#########################################
+## 5. Stop the Parallel Cluster
+#########################################
+stopCluster(cl)
+```
+
+
+
+
+### results for fig 5(using multiple intermediate outcomes)
+```{r}
+
+
+# Set reproducibility seed
+set.seed(123)
+
+# Set bootstrap iterations
+n_boot <- 1000
+
+#########################################
+## 1. Set Up Parallel Backend
+#########################################
+
+RNGkind("L'Ecuyer-CMRG")      # use a parallel‐safe RNG
+
+
+# Detect and use a safe number of cores 
+max_workers <- 50  # Adjust this number if needed
+num_cores <- min(detectCores(), max_workers)
+cl <- makeCluster(num_cores)
+
+clusterSetRNGStream(cl, 123)  # propagate streams to workers
+
+
+registerDoParallel(cl)
+message(sprintf("Using %d worker(s) out of %d detected core(s).", num_cores, parallel::detectCores()))
+
+#########################################
+## 2. Standardize Function
+#########################################
+standardize <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+#########################################
+## 3. Updated Main Analysis Function with Parallel Bootstrapping
+#########################################
+run_multi_analysis <- function(df, star_data, intermediate_grades, outcome_var = "graduate", aux_vars = c()) {
+  
+  # Remove rows with NA in relevant columns
+  relevant_cols <- c("treatment3", "yob", "sch3", outcome_var, aux_vars)
+  df <- df %>% filter(if_all(all_of(relevant_cols), ~!is.na(.)))
+  
+  # 1. Get STAR estimates for specified grades
+  star_estimates <- run_star_estimates(star_data, intermediate_grades, aux_vars)
+  
+  # Initialize results data frame
+  results <- data.frame(
+    method = character(),
+    outcome = character(),
+    intermediate = character(),
+    coef = numeric(),
+    se = numeric(),
+    stringsAsFactors = FALSE
+  )
+  
+  # Extract STAR coefficients
+  betas <- star_estimates$coef_treatment
+  beta_aux <- list()
+  for (var in aux_vars) {
+    beta_aux[[var]] <- star_estimates[[paste0("coef_", var)]]
+  }
+  
+  # Create predictor variables for the surrogate regression
+  pred_vars <- paste0("z_score", intermediate_grades)
+  
+  ### 2. Observational OLS Estimation ###
+  naive_formula_str <- paste0(outcome_var, " ~ treatment3")
+  if (length(aux_vars) > 0) {
+    naive_formula_str <- paste0(naive_formula_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  naive_formula_str <- paste0(naive_formula_str, " | yob + sch3")
+  
+  naive_model <- tryCatch({
+    feols(as.formula(naive_formula_str), data = df)
+  }, error = function(e) {
+    warning(paste("Observational OLS failed for outcome_var =", outcome_var, 
+                  "with intermediate_grades =", paste(intermediate_grades, collapse = ",")))
+    return(NULL)
+  })
+  
+  if (!is.null(naive_model)) {
+    naive_coef <- coef(naive_model)["treatment3"]
+    naive_se <- summary(naive_model)$se["treatment3"]
+    
+    results <- rbind(results, data.frame(
+      method = "Observational OLS",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = naive_coef,
+      se = naive_se,
+      stringsAsFactors = FALSE
+    ))
+  } else {
+    results <- rbind(results, data.frame(
+      method = "Observational OLS",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = NA,
+      se = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  ### 3. Surrogate Estimator ###
+  surrogate_formula_str <- paste0(
+    outcome_var, " ~ ", 
+    paste(pred_vars, collapse = " + ")
+  )
+  if (length(aux_vars) > 0) {
+    surrogate_formula_str <- paste0(surrogate_formula_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  surrogate_formula_str <- paste0(surrogate_formula_str, " | yob + sch3")
+  
+  surrogate_model <- tryCatch({
+    feols(as.formula(surrogate_formula_str), data = df)
+  }, error = function(e) {
+    warning(paste("Surrogate Estimator failed for outcome_var =", outcome_var, 
+                  "with intermediate_grades =", paste(intermediate_grades, collapse = ",")))
+    return(NULL)
+  })
+  
+  if (!is.null(surrogate_model)) {
+    gammas <- coef(surrogate_model)[pred_vars]
+    gamma_aux <- list()
+    if (length(aux_vars) > 0) {
+      for (var in aux_vars) {
+        gamma_aux[[var]] <- coef(surrogate_model)[var]
+      }
+    }
+    
+    surrogate_estimate <- sum(betas * gammas)
+    
+    #### Parallel Bootstrap for Surrogate Standard Error ####
+bootstrap_surrogate_estimates <- foreach(i = 1:n_boot, .combine = c,
+                                         .packages = c("dplyr", "fixest", "rlang"), 
+                                         .export = c("run_star_estimates", "standardize")) %dopar% {
+  # Resample with replacement
+  sample_indices <- sample(1:nrow(df), size = nrow(df), replace = TRUE)
+  df_boot <- df[sample_indices, ]
+  star_data_boot <- star_data[sample_indices, ]
+  
+  
+  star_estimates_boot <- tryCatch({
+    run_star_estimates(star_data_boot, intermediate_grades, aux_vars)
+  }, error = function(e) {
+    message("Error in run_star_estimates on iteration ", i, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(star_estimates_boot)) return(NA)
+  
+  betas_boot <- star_estimates_boot$coef_treatment
+  surrogate_model_boot <- tryCatch({
+    feols(as.formula(surrogate_formula_str), data = df_boot)
+  }, error = function(e) {
+    message("Error in feols for surrogate_model_boot on iteration ", i, ": ", e$message)
+    return(NULL)
+  })
+  
+  if (is.null(surrogate_model_boot)) return(NA)
+  
+  gammas_boot <- coef(surrogate_model_boot)[pred_vars]
+  surrogate_estimate_boot <- sum(betas_boot * gammas_boot)
+  surrogate_estimate_boot
+                                         }
+    
+    
+    surrogate_se <- sd(bootstrap_surrogate_estimates, na.rm = TRUE)
+    
+    results <- rbind(results, data.frame(
+      method = "Surrogate",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = surrogate_estimate,
+      se = surrogate_se,
+      stringsAsFactors = FALSE
+    ))
+    
+    # Store the auxiliary coefficients for the surrogate estimator
+    if (length(aux_vars) > 0) {
+      beta_aux_str <- paste(paste(names(beta_aux), unlist(beta_aux), sep = ": "), collapse = ", ")
+      gamma_aux_str <- paste(paste(names(gamma_aux), unlist(gamma_aux), sep = ": "), collapse = ", ")
+    } else {
+      beta_aux_str <- NA
+      gamma_aux_str <- NA
+    }
+    
+    surrogate_auxiliary <- data.frame(
+      method = "Surrogate",
+      beta_aux = beta_aux_str,
+      gamma_aux = gamma_aux_str,
+      stringsAsFactors = FALSE
+    )
+    
+  } else {
+    results <- rbind(results, data.frame(
+      method = "Surrogate",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = NA,
+      se = NA,
+      stringsAsFactors = FALSE
+    ))
+    
+    surrogate_auxiliary <- data.frame(
+      method = "Surrogate",
+      beta_aux = NA,
+      gamma_aux = NA,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  ### 4. Control Function Method ###
+  df_control <- df
+  for (i in seq_along(intermediate_grades)) {
+    grade <- intermediate_grades[i]
+    z_score_col <- paste0("z_score", grade)
+    selec_col <- paste0("selec", grade)
+    
+    # Base selection term: z_i - beta_i*treatment3
+    df_control[[selec_col]] <- df_control[[z_score_col]] - betas[i] * df_control$treatment3
+    
+    # Add auxiliary terms if any
+    if (length(aux_vars) > 0) {
+      for (var in aux_vars) {
+        df_control[[selec_col]] <- df_control[[selec_col]] - beta_aux[[var]][i] * df_control[[var]]
+      }
+    }
+  }
+  
+  selec_vars <- paste0("selec", intermediate_grades)
+  control_formula_str <- paste0(
+    outcome_var, " ~ treatment3 + ", paste(selec_vars, collapse = " + ")
+  )
+  if (length(aux_vars) > 0) {
+    control_formula_str <- paste0(control_formula_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  control_formula_str <- paste0(control_formula_str, " | yob + sch3")
+  
+  control_model <- tryCatch({
+    feols(as.formula(control_formula_str), data = df_control)
+  }, error = function(e) {
+    warning(paste("Control Function Method failed for outcome_var =", outcome_var, 
+                  "with intermediate_grades =", paste(intermediate_grades, collapse = ",")))
+    return(NULL)
+  })
+  
+  if (!is.null(control_model)) {
+    control_coef <- coef(control_model)["treatment3"]
+    control_se <- summary(control_model)$se["treatment3"]
+    
+    results <- rbind(results, data.frame(
+      method = "Experimental Selection Correction",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = control_coef,
+      se = control_se,
+      stringsAsFactors = FALSE
+    ))
+    
+    #### Parallel Bootstrap for Control Function Standard Error ####
+bootstrap_cf_estimates <- foreach(i = 1:n_boot, .combine = c,
+                                  .packages = c("dplyr", "fixest", "rlang"),
+                                  .export = c("run_star_estimates", "standardize")) %dopar% {
+  sample_indices <- sample(1:nrow(df), size = nrow(df), replace = TRUE)
+  df_boot <- df[sample_indices, ]
+  star_data_boot <- star_data[sample_indices, ]
+  
+  star_estimates_boot <- tryCatch({
+    run_star_estimates(star_data_boot, intermediate_grades, aux_vars)
+  }, error = function(e) { return(NULL) })
+  
+  if(is.null(star_estimates_boot)) return(NA)
+  
+  betas_boot <- star_estimates_boot$coef_treatment
+  beta_aux_boot <- list()
+  for(var in aux_vars) {
+    beta_aux_boot[[var]] <- star_estimates_boot[[paste0("coef_", var)]]
+  }
+  
+  df_control_boot <- df_boot
+  for (j in seq_along(intermediate_grades)) {
+    grade <- intermediate_grades[j]
+    z_score_col <- paste0("z_score", grade)
+    selec_col <- paste0("selec", grade)
+    
+    df_control_boot[[selec_col]] <- df_control_boot[[z_score_col]] - betas_boot[j] * df_control_boot$treatment3
+    
+    if(length(aux_vars) > 0) {
+      for(var in aux_vars) {
+        df_control_boot[[selec_col]] <- df_control_boot[[selec_col]] - beta_aux_boot[[var]][j] * df_control_boot[[var]]
+      }
+    }
+  }
+  
+  control_formula_boot_str <- paste0(
+    outcome_var, " ~ treatment3 + ", 
+    paste(selec_vars, collapse = " + ")
+  )
+  if(length(aux_vars) > 0) {
+    control_formula_boot_str <- paste0(control_formula_boot_str, " + ", paste(aux_vars, collapse = " + "))
+  }
+  control_formula_boot_str <- paste0(control_formula_boot_str, " | yob + sch3")
+  
+  control_model_boot <- tryCatch({
+    feols(as.formula(control_formula_boot_str), data = df_control_boot)
+  }, error = function(e) { return(NULL) })
+  
+  if(is.null(control_model_boot)) return(NA)
+  
+  control_coef_boot <- coef(control_model_boot)["treatment3"]
+  control_coef_boot
+}
+    
+    # Replace the original standard error with the bootstrapped version
+    control_se_boot <- sd(bootstrap_cf_estimates, na.rm = TRUE)
+    results$se[results$method == "Experimental Selection Correction" &
+                 results$outcome == outcome_var &
+                 results$intermediate == paste(intermediate_grades, collapse = ",")] <- control_se_boot
+    
+  } else {
+    results <- rbind(results, data.frame(
+      method = "Experimental Selection Correction",
+      outcome = outcome_var,
+      intermediate = paste(intermediate_grades, collapse = ","),
+      coef = NA,
+      se = NA,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  # Return list with main results and supplementary components
+  return(list(
+    results = results,
+    star_estimates = star_estimates,
+    surrogate_components = list(
+      betas = betas,
+      beta_aux = beta_aux,
+      gammas = if (exists("gammas")) gammas else NA,
+      gamma_aux = if (exists("gamma_aux")) gamma_aux else NA
+    ),
+    surrogate_auxiliary = surrogate_auxiliary
+  ))
+}
+
+#########################################
+## 4. Example: Looping Over Combinations and Aggregating Results
+#########################################
+
+# Define combinations for intermediate grades and auxiliary covariate sets
+short_term_combinations <- list(
+  c(3),
+  c(3, 4),
+  c(3, 4, 5),
+ c(3, 4, 5, 6),
+ c(3, 4, 5, 6, 7),
+ c(3, 4, 5, 6, 7, 8)
+)
+
+aux_cov_col <- list(
+  c()  # No auxiliary covariates
+)
+all_results_list <- list()
+counter <- 1
+
+for (aux_vars in aux_cov_col) {
+  for (intermediate_grades in short_term_combinations) {
+    # Determine maximum grade (for potential z_score outcomes)
+    max_grade <- max(intermediate_grades)
+    
+  
+  
+  # Define outcome_vars: z_score from max_grade to 8, plus "graduate"
+  if(max_grade <= 8){
+    z_scores <- paste0("z_score", max_grade:8)
+  } else {
+    z_scores <- character(0)
+  }
+  
+    # For this example, we run on outcome "graduate"
+    outcome_vars <- c("graduate")
+    #    outcome_vars <- c(z_scores,"graduate")
+
+    for (outcome_var in outcome_vars) {
+      analysis_result <- run_multi_analysis(
+        df = df,
+        star_data = star_raw,
+        intermediate_grades = intermediate_grades,
+        outcome_var = outcome_var,
+        aux_vars = aux_vars
+      )
+      
+      results_df <- analysis_result$results
+      surrogate_auxiliary <- analysis_result$surrogate_auxiliary
+      
+      combined_results <- results_df %>%
+        mutate(
+          intermediate_grades = paste(intermediate_grades, collapse = ","),
+          outcome_var = outcome_var,
+          covariate_spec = ifelse(length(aux_vars) > 0, 
+                                  paste(aux_vars, collapse = ","), 
+                                  "none")
+        ) %>%
+        left_join(surrogate_auxiliary, by = "method") %>%
+        mutate(
+          betas = ifelse(method == "Surrogate", 
+                         paste(analysis_result$surrogate_components$betas, collapse = ", "),
+                         NA),
+          gammas = ifelse(method == "Surrogate", 
+                          paste(analysis_result$surrogate_components$gammas, collapse = ", "),
+                          NA)
+        ) %>%
+        select(
+          intermediate_grades,
+          outcome_var,
+          covariate_spec,
+          method,
+          outcome,
+          intermediate,
+          coef,
+          se,
+          betas,
+          gammas
+        )
+      
+      all_results_list[[counter]] <- combined_results
+      counter <- counter + 1
+    }
+  }
+}
+
+final_results <- bind_rows(all_results_list)
+final_results <- final_results %>% arrange(intermediate_grades, outcome_var, method)
+
+print("Final Combined Results:")
+print(final_results)
+write_xlsx(final_results, "LU_fig3_intermediates_cluster_boot1000.xlsx")
+
+#########################################
+## 5. Stop the Parallel Cluster
+#########################################
+stopCluster(cl)
+```
+
+
+
+
+
+
+# visualizations
+
+
+### subsetting files
+
+```{r}
+
+# Read master Excel file
+master_data <- read_excel("LU_fig3_intermediates_cluster_boot1000_outcomes_interact.xlsx")
+
+# Filter the data based on the criteria
+filtered_data <- master_data %>%
+  filter(
+    intermediate_grades == 3,
+    outcome %in% c("z_score3", "z_score4", "z_score5", "z_score6", "z_score7", "z_score8", "graduate"),
+    covariate_spec == "none",
+    method %in% c("Experimental Selection Correction", "Observational OLS")
+  )
+
+# Write the filtered data to a new Excel file
+write_xlsx(filtered_data, "LU_fig1_without_surr_inuse_boot1000.xlsx")
+
+
+```
+
+
+### initial setup
+
+```{r}
+
+# 1. Define  custom theme
+theme_oi <- function() {
+  theme_classic(base_size = 18) %+replace%  
+    theme(
+      plot.title      = element_text(size = 18, hjust = 0.5, face = "bold"),
+      plot.subtitle   = element_text(size = 16),
+      axis.title.x    = element_text(size = 18),
+      axis.title.y    = element_text(size = 18, margin = margin(r = 10)),  # Adds space between y-axis title and text
+      axis.text.x     = element_text(size = 20),
+      axis.text.y     = element_text(size = 20),
+      axis.ticks.x    = element_blank(),  # **Remove x-axis ticks**
+      legend.title    = element_text(size = 20),
+      legend.text     = element_text(size = 20)
+    )
+}
+# 2. Define  custom color/shape palettes
+method_colors <- c(
+  "Experimental Selection Correction" = "#29B6A4", # teal
+  "Observational OLS"        = "#FAA523", # orange
+  "STAR Experimental Estimate"             = "#000000", # orrgb(33, 56, 101)
+  "Surrogate"        = "#7F4892"  # purple
+)
+
+method_shapes <- c(
+  "Experimental Selection Correction" = 16,
+  "Observational OLS"        = 17,
+  "STAR Experimental Estimate"             = 15,
+  "Surrogate"        = 17
+)
+
+# 3. Create convenience function to activate the style globally
+use_oi_style <- function() {
+  theme_set(theme_oi())  # sets your custom theme globally
+  
+  # Optionally set global color/fill overrides for discrete scales
+  options(
+    ggplot2.discrete.colour = method_colors,
+    ggplot2.discrete.fill   = method_colors
+  )
+}
+
+# 4. Activate style
+use_oi_style()
+
+```
+
+## fig2 main fig
+
+```{r}
+
+## ----------------------------------------------------------
+## 1.  Read data
+## ----------------------------------------------------------
+data_main <- read_excel("LU_fig1_without_surr_inuse_boot1000.xlsx")
+star_true <- read_excel("star_true_inuse.xlsx")
+
+## ----------------------------------------------------------
+## 2.  Harmonise method names & set factor order
+## ----------------------------------------------------------
+method_levels  <- c("STAR Experimental Estimate",
+                    "Experimental Selection Correction",
+                    "Observational OLS")
+
+# shapes and horizontal nudges that match the factor order
+
+
+method_offsets <- c("STAR Experimental Estimate"            =  0.10,
+                    "Experimental Selection Correction"      = -0.10,
+                    "Observational OLS"                      =  0.00)
+
+## ----------------------------------------------------------
+## 3.  Prepare grade-level outcomes (grades 3–8)
+## ----------------------------------------------------------
+grade_data <- data_main %>%
+  filter(outcome != "graduate") %>%
+  mutate(
+    grade  = as.numeric(sub("z_score", "", outcome)),
+    method = recode(method, "Experimental Estimate" = "STAR Experimental Estimate"),
+    method = factor(method, levels = method_levels)
+  )
+
+## ----------------------------------------------------------
+## 4.  Prepare graduation outcome
+## ----------------------------------------------------------
+graduation_data <- data_main %>%
+  filter(outcome == "graduate") %>%
+  mutate(
+    method = recode(method, "Experimental Estimate" = "STAR Experimental Estimate"),
+    method = factor(method, levels = method_levels),
+    coef   = coef * 100,           # convert to percentage-points
+    se     = se   * 100
+  )
+
+## ----------------------------------------------------------
+## 5.  Bring in STAR ‘true’ estimates
+## ----------------------------------------------------------
+star_data <- star_true %>%
+  mutate(
+    method = factor("STAR Experimental Estimate", levels = method_levels),
+    coef   = as.numeric(coef),
+    se     = as.numeric(se)
+  ) %>%
+  select(grade, coef, se, method)
+
+grade_data <- bind_rows(grade_data, star_data)
+
+## ----------------------------------------------------------
+## 6.  Horizontal spacing for clarity
+## ----------------------------------------------------------
+grade_data <- grade_data %>%
+  mutate(grade_spaced = grade + method_offsets[as.character(method)])
+
+## ----------------------------------------------------------
+## 7.  Plot: Grades 3–8 (left panel)
+## ----------------------------------------------------------
+grade_plot <- ggplot(grade_data,
+                     aes(x = grade_spaced, y = coef, colour = method, shape = method)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se), width = 0.18) +
+  geom_line(aes(group = method), linetype = "dashed") +
+  scale_shape_manual(values = method_shapes) +
+  scale_x_continuous(breaks = 3:8, labels = 3:8) +
+  labs(title = "Test Scores",
+       x     = "Grade",
+       y     = "Estimated Treatment Effect on Test Scores (SD)",
+       colour = "Method", shape = "Method") +            
+  theme(legend.position = "bottom",
+        axis.title.y  = element_text(angle = 90, vjust = 0.5))
+
+## ----------------------------------------------------------
+## 8.  Plot: Graduation (right panel)
+## ----------------------------------------------------------
+graduation_plot <- ggplot(graduation_data,
+                          aes(x = outcome, y = coef, colour = method, shape = method)) +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se), width = 0.18) +
+  scale_shape_manual(values = method_shapes) +
+  scale_x_discrete(labels = "") +
+  labs(title = "Graduation",
+       x     = "HS Graduation Rate",
+       y     = "Estimated Treatment Effect on HS Graduation Rate (pp)",
+       colour = "Method", shape = "Method") +
+  theme(legend.position = "bottom",
+        axis.title.y  = element_text(angle = 90, vjust = 0.5))
+
+## ----------------------------------------------------------
+## 9.  Assemble & save
+## ----------------------------------------------------------
+combined_plot <- ggarrange(
+  grade_plot, graduation_plot,
+  ncol = 2, widths = c(2, 1),
+  common.legend = TRUE, legend = "bottom"
+) + theme(legend.box = "horizontal")
+
+print(combined_plot)
+
+ggsave("fig_main_int3.pdf", combined_plot, width = 14, height = 8)
+ggsave("fig_main_int3.svg", combined_plot, width = 14, height = 8)
+
+
+```
+
+![png](R_oi_LU_code_ext_0218_files/R_oi_LU_code_ext_0218_51_0.png)
+
+## fig4 robust-1dhetcut
+
+```{r}
+
+
+#------------------------------------------------------------------------
+# 1. Load subgroup data
+#------------------------------------------------------------------------
+data_subgroup <- read_excel(
+  "all_combined_results_with_LU_and_subgroups_boot1000inuse_withlunch.xlsx",
+  sheet = "Sheet1"
+)
+
+#------------------------------------------------------------------------
+# 2. Stack up graduation results for each subgroup
+#------------------------------------------------------------------------
+subgroup_list <- unique(data_subgroup$subgroup)
+
+graduation_results_subgroup <- bind_rows(
+  lapply(subgroup_list, function(sg) {
+    data_subgroup %>%
+      filter(subgroup == sg,
+             outcome  == "graduate",
+             method   != "Surrogate") %>%
+      mutate(Subgroup = sg)
+  })
+)
+
+#------------------------------------------------------------------------
+# 3. Recode labels & compute percentages + 95% CIs
+#------------------------------------------------------------------------
+graduation_results_subgroup <- graduation_results_subgroup %>%
+  mutate(
+    Subgroup = case_when(
+      Subgroup == "Entire_Population" ~ "Full Sample",
+      Subgroup == "Lunch_Eligible"    ~ "Low-SES\n(Free Lunch Elig.)",
+      Subgroup == "Lunch_Ineligible"  ~ "Higher-SES\n(Free Lunch Inelig.)",
+      TRUE                            ~ as.character(Subgroup)
+    ),
+    coef     = coef * 100,               # β_pct = 100·β
+    se       = se   * 100,               #  SE_pct = 100·SE
+    CI_lower = coef - 1.96 * se,         # 95% CI lower
+    CI_upper = coef + 1.96 * se          # 95% CI upper
+  )
+
+
+#------------------------------------------------------------------------
+# 4. Define custom (uneven) x‐axis positions
+#------------------------------------------------------------------------
+x_map <- c(
+  "Full Sample"                      = 1.0,
+  "Black"                            = 1.6,
+  "White"                            = 2.2,
+  "Male"                             = 2.8,
+  "Female"                           = 3.4,
+  "Low-SES\n(Free Lunch Elig.)"      = 4.2,
+  "Higher-SES\n(Free Lunch Inelig.)" = 5.2
+)
+
+graduation_results_subgroup <- graduation_results_subgroup %>%
+  mutate(
+    x_pos = unname(x_map[as.character(Subgroup)])
+  )
+
+#------------------------------------------------------------------------
+# 5. Plot with dodged methods
+#------------------------------------------------------------------------
+pd            <- position_dodge2(width = 0.09, preserve = "single")
+method_shapes <- c(
+  "Experimental Selection Correction" = 16,
+  "Observational OLS"                 = 17
+)
+
+graduation_plot_subgroup <- ggplot(
+  graduation_results_subgroup,
+  aes(x = x_pos, y = coef, color = method, shape = method)
+) +
+  # horizontal zero‐line
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray") +
+  # points + error bars
+  geom_point(size = 3, position = pd) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper),
+                width = 0.1, position = pd) +
+  # custom axis
+  scale_x_continuous(
+    breaks = x_map,
+    labels = names(x_map),
+    expand = c(0.01, 0.01)
+  ) +
+  # shapes & labels
+  scale_shape_manual(values = method_shapes) +
+  labs(
+    x     = "Subgroup",
+    y     = "Estimated Treatment Effect on HS Graduation Rate (pp)",
+    color = "Method",
+    shape = "Method"
+  ) +
+  theme(
+    axis.text.x  = element_text(hjust = 0.5),
+    axis.title.x = element_text(margin = margin(t = 1.5, unit = "lines")),
+    axis.title.y = element_text(angle = 90, vjust = 0.5),
+    legend.position = "bottom",
+    legend.box      = "horizontal"
+  )
+
+graduation_plot_subgroup <- graduation_plot_subgroup +
+  coord_cartesian(clip = "off") + 
+  theme(
+    plot.margin = margin(
+      t = 80,   # top
+      r = 80,   # right
+      b = 5,    # bottom (you can leave this small)
+      l = 5,    # left
+      unit = "pt"
+    )
+  )
+#------------------------------------------------------------------------
+# 6. Print & save
+#------------------------------------------------------------------------
+print(graduation_plot_subgroup)
+
+ggsave("fig_hetero_subgroup.pdf", graduation_plot_subgroup,
+       width = 13, height = 7)
+ggsave("fig_hetero_subgroup.svg", graduation_plot_subgroup,
+       width = 13, height = 7)
+
+```
+
+
+
+
+
+
+
+
+## fig5 robust-intermediate(originally fig3)
+
+```{r}
+# ======================================================
+# Figure 3: Heterogeneity Across Intermediate Outcome Specifications
+# ======================================================
+
+# ---------------------------
+# 1. Data Loading and Processing
+# ---------------------------
+
+
+# Define custom shapes and colors for methods
+method_shapes <- c("Observational OLS" = 17, "Experimental Selection Correction" = 16)
+method_colors <- c("Observational OLS" = "#FAA523", "Experimental Selection Correction" = "#29B6A4")
+
+# Load the data
+data_fig3 <- read_excel("LU_fig3_intermediates_cluster_boot1000.xlsx", sheet = "Sheet1")
+
+# Filter out Surrogate method upfront if not needed
+data_fig3 <- data_fig3 %>% 
+  filter(method != "Surrogate")%>%
+filter(covariate_spec == "none")
+
+# We only care about the graduation outcome
+graduation_results_fig3 <- data_fig3 %>% 
+  filter(outcome == "graduate")
+
+# Multiply by 100 for percentage representation and compute confidence intervals
+graduation_results_fig3 <- graduation_results_fig3 %>%
+  mutate(
+    coef      = coef * 100,
+    se        = se   * 100,
+    CI_lower  = coef - 1.96 * se,
+    CI_upper  = coef + 1.96 * se
+  )
+
+# Create a factor or label for the intermediate specification
+# (assuming the column is named "intermediate_grades" in your data)
+graduation_results_fig3 <- graduation_results_fig3 %>%
+  mutate(
+    Intermediate = factor(intermediate_grades, 
+                          levels = sort(unique(intermediate_grades)))
+  )
+
+# ---------------------------
+# 2. Separate Methods and Replicate Observational OLS
+# ---------------------------
+
+# 2.1. Extract Experimental Selection Correction data
+control_data <- graduation_results_fig3 %>% 
+  filter(method == "Experimental Selection Correction")
+
+# 2.2. Extract the Observational OLS data 
+# (Observational OLS is presumably the same for all intermediate specs,
+# but we replicate it so we can plot it at each x-axis point)
+
+naive_ols_data <- graduation_results_fig3 %>% 
+  filter(method == "Observational OLS")
+
+# If Observational OLS has multiple rows (identical coefficients), ensure consistency
+# Here, we assume all Observational OLS rows are identical and take the first one
+naive_ols_single <- naive_ols_data %>% 
+  slice(1)
+
+# Replicate the Observational OLS row across all intermediate specifications
+unique_intermediates <- sort(unique(control_data$Intermediate))
+
+rep_naive_ols <- naive_ols_single[rep(1, length(unique_intermediates)), ]
+rep_naive_ols$Intermediate <- unique_intermediates
+
+# Combine the replicated Observational OLS with the Experimental Selection Correction data 
+# (this ensures each intermediate spec has two rows: Experimental Selection Correction and Observational OLS)
+plot_data_fig3 <- bind_rows(
+  control_data,
+  rep_naive_ols
+)
+
+# Optionally reorder the method factor 
+# so they appear in a desired order in the legend
+plot_data_fig3$method <- factor(plot_data_fig3$method,
+                                levels = c("Observational OLS", "Experimental Selection Correction"))
+
+
+
+
+# ---------------------------
+# 2. Separate Methods and Prepare Data
+# ---------------------------
+
+# 2.1. Extract Experimental Selection Correction data
+experimental_data <- graduation_results_fig3 %>% 
+  filter(method == "Experimental Selection Correction")
+
+# 2.2. Extract the Observational OLS data 
+naive_ols_data <- graduation_results_fig3 %>% 
+  filter(method == "Observational OLS") %>%
+  slice(1)  # Assuming all Observational OLS rows are identical
+# ---------------------------
+
+
+```
+
+```{r}
+# ---------------------------
+# 1. Libraries and Custom Theme
+# ---------------------------
+
+
+theme_oi <- function() {
+  theme_classic(base_size = 18) %+replace%  
+    theme(
+      plot.title      = element_text(size = 18, hjust = 0.5, face = "bold"),
+      plot.subtitle   = element_text(size = 16),
+      axis.title.x    = element_text(size = 18),
+      axis.title.y    = element_text(size = 18, margin = margin(r = 10)),  # Adds space between y-axis title and text
+      axis.text.x     = element_text(size = 20),
+      axis.text.y     = element_text(size = 20),
+      axis.ticks.x    = element_blank(), 
+      legend.title    = element_text(size = 20),
+      legend.text     = element_text(size = 20),
+      legend.position = "bottom",
+      legend.box      = "horizontal"
+    )
+}
+
+use_oi_style <- function() {
+  theme_set(theme_oi())
+}
+
+use_oi_style()
+
+
+
+# ---------------------------
+# 3. Separate Data by Method
+# ---------------------------
+
+# Experimental Selection Correction
+experimental_data <- graduation_results_fig3 %>% 
+  filter(method == "Experimental Selection Correction")
+
+# Observational OLS (assuming identical for all specs, take the first row)
+naive_ols_data <- graduation_results_fig3 %>% 
+  filter(method == "Observational OLS") %>%
+  slice(1)  # or whichever row is representative
+
+# ---------------------------
+# 4. Plot
+# ---------------------------
+
+# We will:
+#   - Use color to distinguish the two methods
+#   - Hard-code the shape for the "Experimental Selection Correction" points
+#   - Show horizontal lines for "Observational OLS" with confidence bands hidden from the legend
+
+graduation_plot_fig3 <- ggplot() +
+  # 4.1. Experimental Selection Correction (points + error bars)
+  geom_point(
+    data = experimental_data,
+    aes(x = Intermediate, y = coef, color = "Experimental Selection Correction"),
+    shape = 16,         # solid circle
+    size = 3,
+    position = position_dodge(width = 0.2),
+    show.legend = TRUE
+  ) +
+  geom_errorbar(
+    data = experimental_data,
+    aes(
+      x = Intermediate, 
+      ymin = CI_lower, 
+      ymax = CI_upper, 
+      color = "Experimental Selection Correction"
+    ),
+    width = 0.2,
+    position = position_dodge(width = 0.2),
+    show.legend = FALSE
+  ) +
+  
+  # 4.2. Observational OLS (solid line + dashed CIs)
+  # -- Main coefficient line (shown in legend)
+  geom_hline(
+    aes(yintercept = naive_ols_data$coef, color = "Observational OLS"),
+    linetype = "solid", 
+    size = 1,
+    show.legend = TRUE
+  ) +
+  # -- Confidence interval lines (hidden from legend)
+  geom_hline(
+    aes(yintercept = naive_ols_data$CI_lower, color = "Observational OLS"),
+    linetype = "dashed", 
+    size = 0.8,
+    show.legend = FALSE
+  ) +
+  geom_hline(
+    aes(yintercept = naive_ols_data$CI_upper, color = "Observational OLS"),
+    linetype = "dashed", 
+    size = 0.8,
+    show.legend = FALSE
+  ) +
+  
+  # 4.3. Baseline Horizontal at 0
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray") +
+  
+  # 4.4. Scales for Color
+  scale_color_manual(
+    name = "Method",
+    breaks = c("Experimental Selection Correction", "Observational OLS"),
+    values = c(
+      "Experimental Selection Correction" = "#29B6A4",  # teal
+      "Observational OLS"                 = "#FAA523"   # orange
+    )
+  ) +
+  
+  # 4.5. Legend Overrides
+  #
+  # We override the default legend keys so that:
+  # - "Experimental Selection Correction" appears as a teal circle (no line)
+  # - "Observational OLS" appears as an orange solid line (no point)
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        shape = c(16, NA),       # point for ESC, no point for OLS
+        linetype = c("blank", "solid"),  # no line for ESC, solid line for OLS
+        size = c(3, 1)           # big point for ESC, thinner line for OLS
+      )
+    )
+  ) +
+  
+  # 4.6. Labels and Theme
+  labs(
+    x     = "Test Scores Used as Intermediate Outcomes for Selection Correction",
+    y     = "Estimated Treatment Effect on HS Graduation Rate (pp)"
+  ) +
+  theme(
+    axis.text.x = element_text(size = 20, hjust = 0.5),
+    axis.text.y = element_text(size = 20),
+    axis.title.x = element_text(size = 20, margin = margin(t = 10)),
+    axis.title.y = element_text(size = 20, angle=90, margin = margin(r = 10))
+  )
+
+# ---------------------------
+# 5. Save/Print Plot
+# ---------------------------
+
+print(graduation_plot_fig3)
+
+ggsave("fig_robust_inter.pdf", graduation_plot_fig3, width = 12, height = 9)
+ggsave("fig_robust_inter.svg", graduation_plot_fig3, width = 12, height = 9)
+
+```
+
+```         
+Warning message:
+"[1m[22mUsing `size` aesthetic for lines was deprecated in ggplot2 3.4.0.
+[36mℹ[39m Please use `linewidth` instead."
+```
+
+![png](R_oi_LU_code_ext_0218_files/R_oi_LU_code_ext_0218_61_1.png)
+
+## fig6 surr vs lu zoom in
+
+```{r}
+# ---------------------------
+# 2·2  Plotting 
+# ---------------------------
+
+## ------------------------------------------------------------------
+## 0.  Theme 
+## ------------------------------------------------------------------
+theme_oi <- function() {
+  theme_classic(base_size = 18) %+replace%
+    theme(
+      plot.title    = element_text(size = 18, hjust = .5, face = "bold"),
+      plot.subtitle = element_text(size = 16),
+      axis.title.x  = element_text(size = 18),
+      axis.title.y  = element_text(size = 18, margin = margin(r = 10)),
+      axis.text.x   = element_text(size = 20),
+      axis.text.y   = element_text(size = 20),
+      axis.ticks.x  = element_blank(),
+      legend.title  = element_text(size = 20),
+      legend.text   = element_text(size = 20)
+    )
+}
+
+## ------------------------------------------------------------------
+## 1.  Colours & shapes  
+## ------------------------------------------------------------------
+method_colors <- c(
+  "STAR Experimental Estimate"      = "#000000", # <- same colour, new name
+  "Experimental Selection Correction" = "#29B6A4",
+  "Observational OLS"               = "#FAA523",  # not plotted but kept for safety
+  "Surrogate"                       = "#7F4892"
+)
+
+method_shapes <- c(
+  "STAR Experimental Estimate"      = 15,  # <- still the black square
+  "Experimental Selection Correction" = 16,
+  "Observational OLS"               = 17,
+  "Surrogate"                       = 17
+)
+
+use_oi_style <- function() {
+  theme_set(theme_oi())
+  options(
+    ggplot2.discrete.colour = method_colors,
+    ggplot2.discrete.fill   = method_colors
+  )
+}
+use_oi_style()
+
+## ------------------------------------------------------------------
+## 2.  Read data
+## ------------------------------------------------------------------
+data      <- read_excel("LU_fig3_intermediates_cluster_boot1000_outcomes_interact.xlsx",
+                         sheet = "Sheet1")
+star_true <- read_excel("star_true_inuse.xlsx")
+
+## ------------------------------------------------------------------
+## 3.  Harmonise method labels & factor order  
+## ------------------------------------------------------------------
+method_levels <- c("STAR Experimental Estimate",
+                   "Experimental Selection Correction",
+                   "Surrogate")          # Observational OLS is excluded later
+
+grade_data <- data %>%
+  filter(outcome != "graduate",
+         method  != "Observational OLS",
+         covariate_spec == "none") %>%
+  mutate(
+    grade  = as.numeric(sub("z_score", "", outcome)),
+    method = recode(method,
+                    "Experimental Estimate" = "STAR Experimental Estimate"),
+    method = factor(method, levels = method_levels)
+  )
+
+graduation_data <- data %>%
+  filter(outcome == "graduate",
+         method  != "Observational OLS",
+         covariate_spec == "none") %>%
+  mutate(
+    method = recode(method,
+                    "Experimental Estimate" = "STAR Experimental Estimate"),
+    method = factor(method, levels = method_levels),
+    coef   = coef * 100,
+    se     = se   * 100
+  )
+
+## STAR ground-truth rows
+star_data_main <- star_true %>%
+  mutate(
+    method = factor("STAR Experimental Estimate", levels = method_levels),
+    coef   = as.numeric(coef),
+    se     = as.numeric(se)
+  ) %>%
+  select(grade, coef, se, method)
+
+grade_data <- bind_rows(grade_data, star_data_main)
+
+## ------------------------------------------------------------------
+## 4.  Fixed horizontal offsets
+## ------------------------------------------------------------------
+method_offsets_grades <- c("STAR Experimental Estimate"      =  0.10,
+                           "Experimental Selection Correction" = -0.10,
+                           "Surrogate"                        =  0.00)
+
+grade_data <- grade_data %>%
+  mutate(grade_spaced = grade + method_offsets_grades[as.character(method)])
+
+graduation_data <- graduation_data %>%
+  mutate(outcome_spaced = 1)
+
+dodge_position <- position_dodge(width = 0.1)
+
+## ------------------------------------------------------------------
+## 5.  Plots
+## ------------------------------------------------------------------
+grade_plot <- ggplot(grade_data,
+                     aes(x = grade_spaced, y = coef,
+                         colour = method, shape = method)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se),
+                width = .2) +
+  geom_line(aes(group = method), linetype = "dashed") +
+  scale_shape_manual(values = method_shapes) +
+  scale_color_manual(values = method_colors) +
+  scale_x_continuous(breaks = 3:8, labels = 3:8) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(title = "Test Scores",
+       x = "Grade",
+       y = "Estimated Treatment Effect on Test Scores (SD)",
+       colour = "Method", shape = "Method") +
+  theme(axis.title.y = element_text(angle = 90, vjust = .5),
+        legend.position = "none")
+
+graduation_plot <- ggplot(graduation_data,
+                          aes(x = factor(outcome_spaced), y = coef,
+                              colour = method, shape = method)) +
+  geom_point(size = 3, position = dodge_position) +
+  geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se),
+                width = .05, position = dodge_position) +
+  geom_line(aes(group = method), linetype = "dashed",
+            position = dodge_position) +
+  scale_shape_manual(values = method_shapes) +
+  scale_color_manual(values = method_colors) +
+  scale_x_discrete(labels = "") +
+  labs(title = "Graduation",
+       x = "HS Graduation Rate",
+       y = "Estimated Treatment Effect on HS Graduation Rate (pp)",
+       colour = "Method", shape = "Method") +
+  theme(axis.title.y = element_text(angle = 90, vjust = .5),
+        axis.ticks.x = element_blank(),
+        legend.position = "none")
+
+## ------------------------------------------------------------------
+## 6.  Assemble & save
+## ------------------------------------------------------------------
+combined_plot <- ggpubr::ggarrange(
+  grade_plot, graduation_plot,
+  ncol = 2, widths = c(2, 1),
+  common.legend = TRUE, legend = "bottom"
+) + theme(legend.box = "horizontal")
+
+print(combined_plot)
+
+ggsave("fig_surr_comp.pdf", combined_plot, width = 14, height = 8)
+ggsave("fig_surr_comp.svg", combined_plot, width = 14, height = 8)
+
+```
+
+
+## fig3 aux covariates included
+
+```{r}
+
+# ===========================
+# 1. Define Custom Theme and Style
+# ===========================
+
+# 1.1. Custom Theme Function
+theme_oi <- function() {
+  theme_classic(base_size = 18) %+replace%  
+    theme(
+      plot.title      = element_text(size = 20, hjust = 0.5, face = "bold"),
+      plot.subtitle   = element_text(size = 18),
+      axis.title.x    = element_text(size = 20),
+      axis.title.y    = element_text(size = 20, margin = margin(r = 10)),  # Adds space between y-axis title and text
+      axis.text.x     = element_text(size = 22),
+      axis.text.y     = element_text(size = 22),
+      axis.ticks.x    = element_blank(),  # **Remove x-axis ticks**
+      legend.title    = element_text(size = 22),
+      legend.text     = element_text(size = 22)
+    )
+}
+
+# 1.2. Custom Color Palette
+method_colors <- c(
+  "Experimental Selection Correction"                     = "#29B6A4",  # Teal
+  "Experimental Selection Correction With Demographic Controls"       = "#003A4F",  # Dark Teal/Deep Blue
+  "Observational OLS"                               = "#FAA523",  # Bright Orange
+  "Observational OLS With Demographic Controls"                 = "#8B4513",  # Saddle Brown
+  "Surrogate"                               = "#7F4892",  # Purple
+  "Experimental Estimate"                   = "#015B59"   # Dark Teal
+)
+
+# 1.3. Custom Shape Palette
+method_shapes <- c(
+  "Experimental Selection Correction"                     = 16,  # Solid circle
+  "Experimental Selection Correction With Demographic Controls"       = 18,  # Diamond
+  "Observational OLS"                               = 15,  # Square
+  "Observational OLS With Demographic Controls"                 = 20,  # Filled circle
+  "Surrogate"                               = 19,  # Hollow circle
+  "Experimental Estimate"                   = 8    # Star
+)
+
+# 1.4. Convenience Function to Apply Global Styles
+use_oi_style <- function() {
+  theme_set(theme_oi())  # Sets the custom theme globally
+  
+  # Optionally set global color/fill overrides for discrete scales
+  options(
+    ggplot2.discrete.colour = method_colors,
+    ggplot2.discrete.fill   = method_colors
+  )
+  
+  # Alternatively, if you prefer using scale_manual in plots, you can omit the options above
+}
+
+# 1.5. Activate the Custom Style
+use_oi_style()
+
+# ===========================
+# 2. Figure: Modified Comparison with Auxiliary Controls
+# ===========================
+
+# ---------------------------
+# 2.1. Data Loading and Processing
+# ---------------------------
+
+# Load primary data
+data <- read_excel("LU_fig3_intermediates_cluster_boot1000_outcomes_interact.xlsx", sheet = "Sheet1")
+
+# Load STAR raw data if applicable (uncomment and adjust if needed)
+# star_raw <- read_excel("star_raw.xlsx")  # Uncomment and adjust if needed
+
+# Process data for grades (excluding graduation outcome)
+grade_data <- data %>%
+  # Filter for non-graduation outcomes
+  filter(outcome != "graduate",method != "Surrogate") %>%
+  # Select based on `covariate_spec`
+  mutate(
+    method = case_when(
+      covariate_spec == "other_race,black,female,lunch,miss_lunch_new" & method == "Experimental Selection Correction" ~ "Experimental Selection Correction With Demographic Controls",
+      covariate_spec == "other_race,black,female,lunch,miss_lunch_new" & method == "Observational OLS" ~ "Observational OLS With Demographic Controls",
+      TRUE ~ method  # Retain original method names for `covariate_spec` == "none"
+    ),
+    grade = as.numeric(gsub("z_score", "", outcome))
+  ) %>%
+  # Exclude methods not needed (if any)
+  filter(method %in% c("Experimental Selection Correction", "Experimental Selection Correction With Demographic Controls", "Observational OLS", "Observational OLS With Demographic Controls", "Experimental Estimate", "Surrogate")) %>%
+  # Define factor levels with desired order
+  mutate(
+    method = factor(method, levels = c("Experimental Selection Correction", "Experimental Selection Correction With Demographic Controls", "Observational OLS", "Observational OLS With Demographic Controls", "Experimental Estimate", "Surrogate"))
+  )
+
+# Process data for graduation outcome
+graduation_data <- data %>%
+  filter(outcome == "graduate",method != "Surrogate") %>%
+
+  mutate(
+    method = case_when(
+      covariate_spec == "other_race,black,female,lunch,miss_lunch_new" & method == "Experimental Selection Correction" ~ "Experimental Selection Correction With Demographic Controls",
+      covariate_spec == "other_race,black,female,lunch,miss_lunch_new" & method == "Observational OLS" ~ "Observational OLS With Demographic Controls",
+      TRUE ~ method  # Retain original method names for `covariate_spec` == "none"
+    )
+  ) %>%
+  # Exclude methods not needed (if any)
+  filter(method %in% c("Experimental Selection Correction", "Experimental Selection Correction With Demographic Controls", "Observational OLS", "Observational OLS With Demographic Controls", "Experimental Estimate", "Surrogate")) %>%
+  # Define factor levels with desired order
+  mutate(
+    method = factor(method, levels = c("Experimental Selection Correction", "Experimental Selection Correction With Demographic Controls", "Observational OLS", "Observational OLS With Demographic Controls", "Experimental Estimate", "Surrogate"))
+  )
+
+# Multiply graduation coefficients by 100 for percentage representation
+graduation_data <- graduation_data %>%
+  mutate(
+    coef = coef * 100,
+    se = se * 100
+  )
+
+# ---------------------------
+# 2.2. Plotting
+# ---------------------------
+
+# Define fixed offsets for spacing to prevent overlapping in Grades subplot
+method_offsets_grades <- c(
+  "Experimental Selection Correction"                     = -0.2, 
+  "Experimental Selection Correction With Demographic Controls"       = -0.1,
+  "Observational OLS"                               = -0.2, 
+  "Observational OLS With Demographic Controls"                 = -0.1,
+  "Experimental Estimate"                   = 0.2,
+  "Surrogate"                               = 0.3
+)
+
+# Create a new column with fixed-spaced x-axis values for grades
+grade_data <- grade_data %>%
+  mutate(grade_spaced = grade + method_offsets_grades[as.character(method)])  # Assign fixed offsets per method
+
+# Define fixed offsets for spacing to prevent overlapping in Graduation subplot
+method_offsets_graduation <- c(
+  "Experimental Selection Correction"                     = -0.2, 
+  "Experimental Selection Correction With Demographic Controls"       = -0.1,
+  "Observational OLS"                               = -0.2, 
+  "Observational OLS With Demographic Controls"                 = -0.1,
+  "Experimental Estimate"                   = 0.2,
+  "Surrogate"                               = 0.3
+)
+
+# Assign a base x-value for Graduation plot
+base_x_graduation <- 1
+
+graduation_data <- graduation_data %>%
+  mutate(outcome_spaced = base_x_graduation + method_offsets_graduation[as.character(method)])
+
+# --- IMPORTANT: Add custom labels so that the long text wraps on two lines
+custom_labels <- c(
+  "Experimental Selection Correction"                           = "ESC",
+  "Experimental Selection Correction With Demographic Controls" = "ESC With Demog. Controls",
+  "Observational OLS"                                          = "OLS",
+  "Observational OLS With Demographic Controls"                = "OLS With Demog. Controls",
+  "Surrogate"                                                  = "Surrogate",
+  "Experimental Estimate"                                      = "Experimental Estimate"
+)
+
+# Plot for Grades
+grade_plot <- ggplot(grade_data, aes(x = grade_spaced, y = coef, color = method)) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray") +
+  geom_point(aes(shape = method), size = 3) +
+  geom_errorbar(aes(ymin = coef - 1.96 * se, ymax = coef + 1.96 * se), width = 0.1) +
+  geom_line(aes(group = method), linetype = "dashed") +
+  scale_shape_manual(values = method_shapes, labels = custom_labels) +
+  scale_color_manual(values = method_colors, labels = custom_labels) +
+  scale_x_continuous(
+    breaks = 3:8,
+    labels = 3:8
+  ) +
+  labs(
+    title = "Test Scores",
+    x = "Grade",
+    y = "Estimated Treatment Effect on Test Scores (SD)",
+    color = "Method",
+    shape = "Method"
+  ) +
+  theme(
+    axis.title.y   = element_text(angle = 90, vjust = 0.5),
+    legend.position = "none"
+  )
+
+# Plot for Graduation
+graduation_plot <- ggplot(graduation_data, aes(x = outcome_spaced, y = coef, color = method)) +
+  geom_hline(yintercept = 0, linetype = "solid", color = "gray") +
+  geom_point(aes(shape = method), size = 3) +
+  geom_errorbar(aes(ymin = coef - 1.96 * se, ymax = coef + 1.96 * se), width = 0.1) +
+  scale_shape_manual(values = method_shapes, labels = custom_labels) +
+  scale_color_manual(values = method_colors, labels = custom_labels) +
+  scale_x_continuous(
+    breaks = base_x_graduation, 
+    labels = c(""),
+    limits = c(base_x_graduation - 0.5, base_x_graduation + 0.5)
+  ) +
+  labs(
+    title = "Graduation",
+    x = "HS Graduation Rate",
+    y = "Estimated Treatment Effect on HS Graduation Rate (pp)",
+    color = "Method",
+    shape = "Method"
+  ) +
+  theme(
+    axis.title.y    = element_text(angle = 90, vjust = 0.5),
+    legend.position = "none"
+  )
+
+# Combine the two plots side by side
+combined_plot <- ggpubr::ggarrange(
+  grade_plot, 
+  graduation_plot, 
+  ncol = 2, 
+  nrow = 1, 
+  widths = c(2, 1),
+  common.legend = TRUE,
+  legend = "bottom"
+)
+
+combined_plot <- combined_plot +
+  theme(
+    legend.position = "bottom",
+    legend.box = "horizontal"
+  )
+
+# Display
+print(combined_plot)
+
+# Save
+ggsave("fig_naiveols_sc_auxcontrols.pdf", plot = combined_plot, width = 14, height = 8)
+ggsave("fig_naiveols_sc_auxcontrols.svg", plot = combined_plot, width = 14, height = 8)
+
+```
+
+![png](R_oi_LU_code_ext_0218_files/R_oi_LU_code_ext_0218_65_0.png)
+
+## app table 1.1 (sum stats for star)
+
+```{r}
+
+star_raw_teh <- read_dta(file.path(DATA_PATH, "STAR_extract_TEH.dta"))
+
+```
+
+
+```{r}
+star_raw <- read_dta(file.path(DATA_PATH,"STAR_extract.dta"))
+
+```
+
+```{r}
+
+# Identify overlapping columns (excluding 'ID')
+overlapping_cols <- intersect(names(star_raw_teh), names(star_raw))
+overlapping_cols <- setdiff(overlapping_cols, "ID")
+
+# Identify columns unique to star_raw_teh (excluding 'ID')
+teh_unique_cols <- setdiff(names(star_raw_teh), c("ID", names(star_raw)))
+
+# Perform the full join, keeping all columns from star_raw and only unique columns from star_raw_teh
+merged_data <- star_raw %>%
+  full_join(
+    star_raw_teh %>% select(ID, all_of(teh_unique_cols)),
+    by = "ID"
+  )
+
+# View the merged dataframe
+head(merged_data)
+
+names(merged_data)
+
+
+```
+
+
+
+```{r}
+star_raw = merged_data
+star_raw$miss_lunch_new <- ifelse(is.na(star_raw$lunch), 1, 0)
+
+```
+
+
+```{r}
+#------------------------------------------------------------------------------
+# Panel A: Student Background Variables for STAR
+#------------------------------------------------------------------------------
+panel_A_star <- star_raw %>%
+  summarise(
+    # 1. Female (%)
+    Female_mean    = mean(female,               na.rm = TRUE) * 100,
+    Female_sd      = sd(female,                 na.rm = TRUE) * 100,
+
+    # 2. Eligible for Free/Reduced-Price Lunch (%)
+    FRPL_mean      = mean(lunch[miss_lunch_new==0], na.rm = TRUE) * 100,
+    FRPL_sd        = sd(lunch[miss_lunch_new==0],   na.rm = TRUE) * 100,
+
+    # 3. Missing Free-Lunch Indicator (%)
+    MissFRPL_mean  = mean(miss_lunch_new,        na.rm = TRUE) * 100,
+    MissFRPL_sd    = sd(miss_lunch_new,          na.rm = TRUE) * 100,
+
+    # 4. Graduated from NYC Public HS (not observed in STAR)
+    GradHS_mean    = NA_real_,
+    GradHS_sd      = NA_real_,
+
+    # 5–10. Race/Ethnicity (%), using race codes 1=WHITE,2=BLACK,3=ASIAN,4=HISPANIC,5=NATIVE AMERICAN,6=OTHER
+    White_mean     = mean(race == 1,             na.rm = TRUE) * 100,
+    White_sd       = sd(  as.integer(race == 1), na.rm = TRUE) * 100,
+
+    Black_mean     = mean(race == 2,             na.rm = TRUE) * 100,
+    Black_sd       = sd(  as.integer(race == 2), na.rm = TRUE) * 100,
+
+    Asian_mean     = mean(race == 3,             na.rm = TRUE) * 100,
+    Asian_sd       = sd(  as.integer(race == 3), na.rm = TRUE) * 100,
+
+    Hisp_mean      = mean(race == 4,             na.rm = TRUE) * 100,
+    Hisp_sd        = sd(  as.integer(race == 4), na.rm = TRUE) * 100,
+
+    NativeAm_mean  = mean(race == 5,             na.rm = TRUE) * 100,
+    NativeAm_sd    = sd(  as.integer(race == 5), na.rm = TRUE) * 100,
+
+    Other_mean     = mean(race == 6,             na.rm = TRUE) * 100,
+    Other_sd       = sd(  as.integer(race == 6), na.rm = TRUE) * 100
+  ) %>%
+  # reshape + lock in the exact display order
+  pivot_longer(
+    everything(),
+    names_to = c("Variable","Stat"),
+    names_sep = "_",
+    values_to = "Value"
+  ) %>%
+  pivot_wider(names_from = Stat, values_from = Value) %>%
+  mutate(Variable = factor(Variable, levels = c(
+    "Female",
+    "FRPL", "MissFRPL", "GradHS",
+    "White","Black","Asian","Hisp","NativeAm","Other"
+  )))
+
+#------------------------------------------------------------------------------
+# Panel B: Classroom Characteristics for STAR
+#------------------------------------------------------------------------------
+panel_B_star <- star_raw %>%
+  mutate(
+    # actual grade-3 assignment
+    InSmall3       = small3,
+    SizeLarge3     = if_else(small3 == 0, kids3, NA_real_),
+    SizeSmall3     = if_else(small3 == 1, kids3, NA_real_),
+    # initial randomized assignment
+    InitSmall      = smalli,
+    InitLargeSize  = if_else(smalli == 0, kids3, NA_real_),
+    InitSmallSize  = if_else(smalli == 1, kids3, NA_real_)
+  ) %>%
+  summarise(
+    # 1. Class Size in Grade 3
+    CS3_mean            = mean(kids3,        na.rm = TRUE),
+    CS3_sd              = sd(kids3,          na.rm = TRUE),
+
+    # 2. In Small Class at Grade 3 (%)
+    InSmall3_mean       = mean(InSmall3,     na.rm = TRUE) * 100,
+    InSmall3_sd         = sd(InSmall3,       na.rm = TRUE) * 100,
+
+    # 3. Size Given Large Class
+    Large3_mean         = mean(SizeLarge3,    na.rm = TRUE),
+    Large3_sd           = sd(SizeLarge3,      na.rm = TRUE),
+
+    # 4. Size Given Small Class
+    Small3_mean         = mean(SizeSmall3,    na.rm = TRUE),
+    Small3_sd           = sd(SizeSmall3,      na.rm = TRUE),
+
+    # 5. Initial Assignment to Small Class Size (%)
+    InitSmall_mean      = mean(InitSmall,     na.rm = TRUE) * 100,
+    InitSmall_sd        = sd(InitSmall,       na.rm = TRUE) * 100,
+
+    # 6. Size Given Large Class Assignment
+    InitLargeSize_mean  = mean(InitLargeSize, na.rm = TRUE),
+    InitLargeSize_sd    = sd(InitLargeSize,   na.rm = TRUE),
+
+    # 7. Size Given Small Class Assignment
+    InitSmallSize_mean  = mean(InitSmallSize, na.rm = TRUE),
+    InitSmallSize_sd    = sd(InitSmallSize,   na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Variable","Stat"),
+    names_sep = "_",
+    values_to = "Value"
+  ) %>%
+  pivot_wider(names_from = Stat, values_from = Value) %>%
+  mutate(Variable = factor(Variable, levels = c(
+    "CS3",
+    "InSmall3","Large3","Small3",
+    "InitSmall","InitLargeSize","InitSmallSize"
+  )))
+
+#------------------------------------------------------------------------------
+# Combine panels
+#------------------------------------------------------------------------------
+star_summary <- bind_rows(panel_A_star, panel_B_star)
+
+print(star_summary)
+
+```
+
+
+
+
+
+
+
+
+## app table 1.2 (nyc summary tab)
+
+```{r}
+df <- read_dta(file.path(DATA_PATH, "dataset_for_kevin_R_041825.dta")) 
+```
+
+
+
+```{r}
+#------------------------------------------------------------------------------
+#  Panel A: Student Background Variables (in table order)
+#------------------------------------------------------------------------------
+
+
+panel_A <- df %>%
+  summarise(
+    # 1. Female (%)
+    Female_mean = mean(female,      na.rm = TRUE) * 100,
+    Female_sd   = sd(female,        na.rm = TRUE) * 100,
+
+    # 2. Eligible for Free/Reduced-Price Lunch (%)
+    FRPL_mean   = mean(lunch3[miss_lunch_new == 0],      na.rm = TRUE) * 100,
+    FRPL_sd     = sd(lunch3[miss_lunch_new == 0],        na.rm = TRUE) * 100,
+
+    # 3. Missing Free Lunch Indicator (%)
+    MissFRPL_mean = mean(miss_lunch_new, na.rm = TRUE) * 100,
+    MissFRPL_sd   = sd(miss_lunch_new,   na.rm = TRUE) * 100,
+
+    # 4. Graduated from NYC Public High School (%)
+    GradHS_mean = mean(graduate,    na.rm = TRUE) * 100,
+    GradHS_sd   = sd(graduate,      na.rm = TRUE) * 100,
+
+    # 5–10. Race/Ethnicity dummies (%)
+    White_mean  = mean(as.integer(ethnicity == 5), na.rm = TRUE) * 100,
+    White_sd    = sd(as.integer(ethnicity == 5),   na.rm = TRUE) * 100,
+
+    Black_mean  = mean(as.integer(ethnicity == 4), na.rm = TRUE) * 100,
+    Black_sd    = sd(as.integer(ethnicity == 4),   na.rm = TRUE) * 100,
+
+    Asian_mean  = mean(as.integer(ethnicity == 2), na.rm = TRUE) * 100,
+    Asian_sd    = sd(as.integer(ethnicity == 2),   na.rm = TRUE) * 100,
+
+    Hisp_mean   = mean(as.integer(ethnicity == 3), na.rm = TRUE) * 100,
+    Hisp_sd     = sd(as.integer(ethnicity == 3),   na.rm = TRUE) * 100,
+
+    NativeAm_mean = mean(as.integer(ethnicity == 1), na.rm = TRUE) * 100,
+    NativeAm_sd   = sd(as.integer(ethnicity == 1),   na.rm = TRUE) * 100
+  ) %>%
+  # Turn into long form, preserving the exact order above
+  pivot_longer(
+    everything(),
+    names_to = c("Variable","Stat"),
+    names_sep = "_",
+    values_to = "Value"
+  ) %>%
+  pivot_wider(names_from = Stat, values_from = Value) %>%
+  mutate(Variable = factor(Variable, levels = c(
+    "Female",
+    "FRPL", "MissFRPL", "GradHS",
+    "White","Black","Asian","Hisp","NativeAm"
+  )))
+
+#------------------------------------------------------------------------------
+#  Panel B: Classroom Characteristics (in table order)
+#------------------------------------------------------------------------------
+panel_B <- df %>%
+  # we'll need class_size3 and treatment3 for these
+  mutate(
+    InSmall3 = treatment3,
+    SizeLarge3 = if_else(treatment3 == 0, class_size3, NA_real_),
+    SizeSmall3 = if_else(treatment3 == 1, class_size3, NA_real_)
+  ) %>%
+  summarise(
+    # 1. Class Size in Grade 3
+    CS3_mean     = mean(class_size3, na.rm = TRUE),
+    CS3_sd       = sd(class_size3,   na.rm = TRUE),
+
+    # 2. In Small Class at Grade 3 (%)
+    InSmall3_mean = mean(InSmall3,    na.rm = TRUE) * 100,
+    InSmall3_sd   = sd(InSmall3,      na.rm = TRUE) * 100,
+
+    # 3. Size Given Large Class
+    Large3_mean  = mean(SizeLarge3,   na.rm = TRUE),
+    Large3_sd    = sd(SizeLarge3,     na.rm = TRUE),
+
+    # 4. Size Given Small Class
+    Small3_mean  = mean(SizeSmall3,   na.rm = TRUE),
+    Small3_sd    = sd(SizeSmall3,     na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Variable","Stat"),
+    names_sep = "_",
+    values_to = "Value"
+  ) %>%
+  pivot_wider(names_from = Stat, values_from = Value) %>%
+  mutate(Variable = factor(Variable, levels = c(
+    "CS3", "InSmall3", "Large3", "Small3"
+  )))
+
+#------------------------------------------------------------------------------
+#  Bind panels together
+#------------------------------------------------------------------------------
+nyc_summary <- bind_rows(
+  panel_A   %>% arrange(Variable),
+  panel_B   %>% arrange(Variable)
+)
+
+print(nyc_summary)
+```
+
+
+
+
+## app table 2 output is already created in LU_fig3_intermediates_cluster_boot1000_outcomes_interact.xlsx
