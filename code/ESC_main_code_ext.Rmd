@@ -1775,7 +1775,7 @@ grade_plot <- ggplot(grade_data,
   geom_hline(yintercept = 0, colour = "grey60") +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se), width = 0.18) +
-  geom_line(aes(group = method), linetype = "dashed") +
+  geom_line(aes(group = method), linetype = "solid") +
   scale_shape_manual(values = method_shapes) +
   scale_x_continuous(breaks = 3:8, labels = 3:8) +
   labs(title = "Test Scores",
@@ -2135,7 +2135,7 @@ graduation_plot_fig3 <- ggplot() +
     show.legend = FALSE
   ) +
   
-  # 4.2. Observational OLS (solid line + dashed CIs)
+  # 4.2. Observational OLS (solid line + solid CIs)
   # -- Main coefficient line (shown in legend)
   geom_hline(
     aes(yintercept = naive_ols_data$coef, color = "Observational OLS"),
@@ -2146,13 +2146,13 @@ graduation_plot_fig3 <- ggplot() +
   # -- Confidence interval lines (hidden from legend)
   geom_hline(
     aes(yintercept = naive_ols_data$CI_lower, color = "Observational OLS"),
-    linetype = "dashed", 
+    linetype = "solid", 
     size = 0.8,
     show.legend = FALSE
   ) +
   geom_hline(
     aes(yintercept = naive_ols_data$CI_upper, color = "Observational OLS"),
-    linetype = "dashed", 
+    linetype = "solid", 
     size = 0.8,
     show.legend = FALSE
   ) +
@@ -2339,7 +2339,7 @@ grade_plot <- ggplot(grade_data,
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se),
                 width = .2) +
-  geom_line(aes(group = method), linetype = "dashed") +
+  geom_line(aes(group = method), linetype = "solid") +
   scale_shape_manual(values = method_shapes) +
   scale_color_manual(values = method_colors) +
   scale_x_continuous(breaks = 3:8, labels = 3:8) +
@@ -2357,7 +2357,7 @@ graduation_plot <- ggplot(graduation_data,
   geom_point(size = 3, position = dodge_position) +
   geom_errorbar(aes(ymin = coef - 1.96*se, ymax = coef + 1.96*se),
                 width = .05, position = dodge_position) +
-  geom_line(aes(group = method), linetype = "dashed",
+  geom_line(aes(group = method), linetype = "solid",
             position = dodge_position) +
   scale_shape_manual(values = method_shapes) +
   scale_color_manual(values = method_colors) +
@@ -2555,7 +2555,7 @@ grade_plot <- ggplot(grade_data, aes(x = grade_spaced, y = coef, color = method)
   geom_hline(yintercept = 0, linetype = "solid", color = "gray") +
   geom_point(aes(shape = method), size = 3) +
   geom_errorbar(aes(ymin = coef - 1.96 * se, ymax = coef + 1.96 * se), width = 0.1) +
-  geom_line(aes(group = method), linetype = "dashed") +
+  geom_line(aes(group = method), linetype = "solid") +
   scale_shape_manual(values = method_shapes, labels = custom_labels) +
   scale_color_manual(values = method_colors, labels = custom_labels) +
   scale_x_continuous(
